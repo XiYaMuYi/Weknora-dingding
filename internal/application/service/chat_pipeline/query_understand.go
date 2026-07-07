@@ -374,9 +374,9 @@ func parseStructuredQueryOutputJSON(content string) (queryUnderstandOutput, bool
 			"rewrite_query", "rewritten_query", "query", "question")),
 	}
 
-	intentStr := strings.TrimSpace(firstStringField(obj, "intent"))
+	intentStr := strings.TrimSpace(firstStringField(obj, "intent", "意图", "intent_type", "classification"))
 	if intentStr != "" {
-		out.Intent = types.QueryIntent(intentStr)
+		out.Intent = types.NormalizeQueryIntent(intentStr)
 	}
 
 	desc := strings.TrimSpace(firstStringField(obj,

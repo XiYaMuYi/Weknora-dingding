@@ -5662,12 +5662,14 @@ export default {
     },
     connector: {
       feishu: "飞书",
+      dingtalk: "钉钉",
       notion: "Notion",
       yuque: "语雀",
       rss: "RSS / Atom 订阅",
     },
     connectorDesc: {
       feishu: "同步飞书知识库中的文档、表格、文件",
+      dingtalk: "同步钉钉在线文档到知识库",
       notion: "同步 Notion 中的页面和数据库",
       yuque: "同步语雀知识库中的文档",
       rss: "同步 RSS / Atom 订阅源中的文章",
@@ -5675,6 +5677,8 @@ export default {
     field: {
       appId: "App ID",
       appSecret: "App Secret",
+      appKey: "AppKey",
+      corpId: "企业CorpId",
       integrationToken: "Integration Token",
       apiToken: "API Token",
       baseUrl: "Base URL（可选）",

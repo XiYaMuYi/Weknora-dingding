@@ -5,6 +5,7 @@ import rssIcon from '@/assets/img/datasource-rss.svg'
 
 export const datasourceIconMap: Record<string, string> = {
   feishu: feishuIcon,
+  dingtalk: feishuIcon, // TODO: replace with a dedicated datasource-dingtalk.ico
   notion: notionIcon,
   yuque: yuqueIcon,
   rss: rssIcon,

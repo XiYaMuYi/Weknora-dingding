@@ -6,6 +6,31 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
+func TestParseStructuredQueryOutputJSON_ChineseIntentField(t *testing.T) {
+	raw := `{"rewrite_query":"什么是RAG","意图":"咨询","image_description":""}`
+	out, ok := parseStructuredQueryOutputJSON(raw)
+	if !ok {
+		t.Fatal("expected parse ok")
+	}
+	if out.Intent != types.IntentKBSearch {
+		t.Errorf("intent: got %q, want kb_search", out.Intent)
+	}
+	if out.RewriteQuery != "什么是RAG" {
+		t.Errorf("rewrite_query: got %q", out.RewriteQuery)
+	}
+}
+
+func TestParseStructuredQueryOutputJSON_UnknownIntentFallback(t *testing.T) {
+	raw := `{"rewrite_query":"q","intent":"随便写的","image_description":""}`
+	out, ok := parseStructuredQueryOutputJSON(raw)
+	if !ok {
+		t.Fatal("expected parse ok")
+	}
+	if out.Intent != types.IntentKBSearch {
+		t.Errorf("unknown intent should fallback to kb_search, got %q", out.Intent)
+	}
+}
+
 func TestApplyIntentPromptOverride_AgentOverrideWins(t *testing.T) {
 	cm := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{

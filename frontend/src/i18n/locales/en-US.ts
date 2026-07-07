@@ -5649,19 +5649,23 @@ export default {
     },
     connector: {
       feishu: 'Feishu',
+      dingtalk: 'DingTalk',
       notion: 'Notion',
       yuque: 'Yuque',
       rss: 'RSS / Atom Feed',
     },
     connectorDesc: {
       feishu: 'Sync documents, spreadsheets and files from Feishu Wiki',
+      dingtalk: 'Sync DingTalk online documents to knowledge base',
       notion: 'Sync pages and databases from Notion',
       yuque: 'Sync documents from Yuque knowledge bases',
       rss: 'Sync articles from RSS / Atom feeds',
     },
     field: {
       appId: 'App ID',
+      appKey: 'AppKey',
       appSecret: 'App Secret',
+      corpId: 'Corp ID',
       integrationToken: 'Integration Token',
       apiToken: 'API Token',
       baseUrl: 'Base URL (optional)',
