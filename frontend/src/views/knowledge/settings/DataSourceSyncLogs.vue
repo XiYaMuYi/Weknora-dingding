@@ -131,6 +131,10 @@ function hasPills(log: SyncLog) {
   return log.items_created > 0 || log.items_updated > 0 || log.items_deleted > 0 || log.items_skipped > 0 || log.items_failed > 0
 }
 
+function skippedDetails(log: SyncLog) {
+  return log.result?.skipped_details || []
+}
+
 // Group logs by date
 const groupedLogs = computed(() => {
   const groups: { date: string; logs: SyncLog[] }[] = []
@@ -255,6 +259,16 @@ const groupedLogs = computed(() => {
                 </div>
                 <div v-if="log.error_message" class="tl-error">
                   {{ log.error_message }}
+                </div>
+                <div v-if="skippedDetails(log).length > 0" class="tl-skip-detail">
+                  <div class="tl-skip-title">{{ t('datasource.logDetail.skippedReason') }}</div>
+                  <div
+                    v-for="detail in skippedDetails(log)"
+                    :key="detail"
+                    class="tl-skip-item"
+                  >
+                    {{ detail }}
+                  </div>
                 </div>
               </div>
             </div>
@@ -510,6 +524,26 @@ const groupedLogs = computed(() => {
   color: var(--td-error-color);
   font-size: 12px;
   line-height: 1.5;
+  word-break: break-word;
+}
+
+.tl-skip-detail {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tl-skip-title {
+  margin-bottom: 4px;
+  color: var(--td-text-color-primary);
+  font-weight: 600;
+}
+
+.tl-skip-item {
   word-break: break-word;
 }
 

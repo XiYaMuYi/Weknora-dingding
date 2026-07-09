@@ -2023,6 +2023,7 @@ func (s *knowledgeService) ReparseKnowledge(
 		existing.ParseStatus = "pending"
 		existing.EnableStatus = "disabled"
 		existing.Description = ""
+		existing.ErrorMessage = ""
 		existing.ProcessedAt = nil
 		existing.EmbeddingModelID = kb.EmbeddingModelID
 		// Reset the enrichment counter so a leftover value from a
@@ -2064,6 +2065,7 @@ func (s *knowledgeService) ReparseKnowledge(
 	existing.ParseStatus = "pending"
 	existing.EnableStatus = "disabled"
 	existing.Description = ""
+	existing.ErrorMessage = ""
 	existing.ProcessedAt = nil
 	existing.EmbeddingModelID = kb.EmbeddingModelID
 	// Reset the enrichment counter so a leftover value from a previous

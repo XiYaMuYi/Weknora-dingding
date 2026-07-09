@@ -91,6 +91,13 @@ func reloadKnowledgeRow(t *testing.T, db *gorm.DB, id string) (status string, co
 	return status, count
 }
 
+func reloadKnowledgeStatusAndError(t *testing.T, db *gorm.DB, id string) (status string, errorMessage string) {
+	t.Helper()
+	row := db.Raw(`SELECT parse_status, COALESCE(error_message, '') FROM knowledges WHERE id = ?`, id).Row()
+	require.NoError(t, row.Scan(&status, &errorMessage))
+	return status, errorMessage
+}
+
 func insertKnowledgeWithStatus(t *testing.T, db *gorm.DB, status string, deleted bool) string {
 	t.Helper()
 	id := uuid.New().String()
@@ -204,6 +211,25 @@ func TestFinalizeSubtask_DecrementClampedAtZero(t *testing.T) {
 	status, count := reloadKnowledgeRow(t, db, id)
 	assert.Equal(t, types.ParseStatusCompleted, status)
 	assert.Equal(t, 0, count, "pending_subtasks_count must be clamped at zero")
+}
+
+func TestFinalizeSubtask_ClearsPreviousErrorOnPromote(t *testing.T) {
+	db := setupKnowledgeTestDB(t)
+	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
+	ctx := context.Background()
+
+	id := insertProcessingKnowledge(t, db)
+	require.NoError(t, repo.UpdateKnowledgeColumn(ctx, id, "error_message", "previous parse failed"))
+	_, err := repo.SetFinalizing(ctx, id, 1)
+	require.NoError(t, err)
+
+	_, promoted, err := repo.FinalizeSubtask(ctx, id)
+	require.NoError(t, err)
+	require.True(t, promoted)
+
+	status, errorMessage := reloadKnowledgeStatusAndError(t, db, id)
+	assert.Equal(t, types.ParseStatusCompleted, status)
+	assert.Empty(t, errorMessage)
 }
 
 // TestUpdateKnowledge_DoesNotClobberPendingCounter is the regression test

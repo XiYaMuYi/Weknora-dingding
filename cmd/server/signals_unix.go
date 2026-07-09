@@ -4,7 +4,12 @@ package main
 
 import (
 	"os"
+	"os/signal"
 	"syscall"
 )
 
-var shutdownSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP}
+func init() {
+	signal.Ignore(syscall.SIGHUP)
+}
+
+var shutdownSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM}

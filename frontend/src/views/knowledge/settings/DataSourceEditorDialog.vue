@@ -415,7 +415,6 @@ const connectorDefs = computed<ConnectorDef[]>(() => [
     fields: [
       { key: 'app_key', labelKey: 'datasource.field.appKey', placeholder: '', secret: false },
       { key: 'app_secret', labelKey: 'datasource.field.appSecret', placeholder: '', secret: true },
-      { key: 'corp_id', labelKey: 'datasource.field.corpId', placeholder: '', secret: false },
     ],
   },
 ])
@@ -459,15 +458,18 @@ watch(visible, async (v) => {
     refreshCredentialsStatus()
     testResult.value = credentialsConfigured.value ? 'success' : ''
     const editConfig = props.dataSource.config || {}
+    const editSettings = props.dataSource.type === 'rss'
+      ? hydrateRssFeedUrlsFromConfig(editConfig)
+      : (editConfig.settings || {})
     form.value = {
       name: props.dataSource.name,
       type: props.dataSource.type,
       config: {
         credentials: {},
         resource_ids: editConfig.resource_ids || [],
-        settings: props.dataSource.type === 'rss'
-          ? hydrateRssFeedUrlsFromConfig(editConfig)
-          : (editConfig.settings || {}),
+        settings: props.dataSource.type === 'dingtalk'
+          ? normalizeDingTalkSettings(editSettings)
+          : editSettings,
       },
       sync_schedule: props.dataSource.sync_schedule,
       sync_mode: props.dataSource.sync_mode,
@@ -524,19 +526,165 @@ watch(
   },
 )
 
+watch(
+  () => [
+    form.value.config.settings.union_id,
+    form.value.config.settings.dingtalk_type,
+    form.value.config.settings.manual_resource_ids,
+  ],
+  () => {
+    if (form.value.type === 'dingtalk') {
+      testResult.value = ''
+      testErrorMsg.value = ''
+    }
+  },
+)
+
 function selectType(def: ConnectorDef) {
   if (!def.available) return
   form.value.type = def.type
   form.value.name = t(`datasource.connector.${def.type}`)
   form.value.config.credentials = {}
+  form.value.config.settings = def.type === 'dingtalk'
+    ? { dingtalk_type: 'drive', union_id: '' }
+    : {}
   rssAuthHeaders.value = []
   step.value = 1
+}
+
+function normalizeDingTalkSettings(settings: Record<string, any> = {}) {
+  const dingtalkType = settings.dingtalk_type === 'wiki' ? 'wiki' : 'drive'
+  return {
+    ...settings,
+    dingtalk_type: dingtalkType,
+    union_id: settings.union_id || settings.operator_union_id || settings.unionId || settings.corp_id || '',
+  }
+}
+
+function stripDingTalkResourceID(id: string) {
+  const value = String(id || '').trim()
+  if (value.startsWith('wiki:')) {
+    const rest = value.slice('wiki:'.length)
+    const idx = rest.indexOf(':node:')
+    return idx >= 0 ? rest.slice(idx + ':node:'.length) : rest
+  }
+  if (value.startsWith('space:')) {
+    const rest = value.slice('space:'.length)
+    const idx = rest.indexOf(':dentry:')
+    return idx >= 0 ? rest.slice(idx + ':dentry:'.length) : rest
+  }
+  return value
+}
+
+function getDingTalkRootResourceID(id: string): string {
+  const value = String(id || '').trim()
+  if (value.startsWith('wiki:')) {
+    const rest = value.slice('wiki:'.length)
+    const idx = rest.indexOf(':node:')
+    return idx >= 0 ? `wiki:${rest.slice(0, idx)}` : value
+  }
+  if (value.startsWith('space:')) {
+    const rest = value.slice('space:'.length)
+    const idx = rest.indexOf(':dentry:')
+    return idx >= 0 ? `space:${rest.slice(0, idx)}` : value
+  }
+  return value
+}
+
+function getDingTalkType(): 'drive' | 'wiki' {
+  return form.value.config.settings.dingtalk_type === 'wiki' ? 'wiki' : 'drive'
+}
+
+function resetResourcePickerState() {
+  resources.value = []
+  selectedResourceIds.value = []
+  form.value.config.resource_ids = []
+  expandedResourceIds.value = new Set()
+  loadedChildrenIds.value = new Set()
+  loadingChildrenIds.value = new Set()
+  treeFullyLoaded.value = false
+}
+
+function setDingTalkType(type: 'drive' | 'wiki') {
+  ensureDingTalkSettings()
+  if (getDingTalkType() === type) return
+  form.value.config.settings.dingtalk_type = type
+  form.value.config.settings.manual_resource_ids = ''
+  resetResourcePickerState()
+  testResult.value = ''
+  testErrorMsg.value = ''
+}
+
+function ensureDingTalkSettings() {
+  if (form.value.type !== 'dingtalk') return
+  form.value.config.settings = normalizeDingTalkSettings(form.value.config.settings)
+}
+
+function getManualDingTalkResourceLines(): string[] {
+  if (form.value.type !== 'dingtalk') return []
+  return String(form.value.config.settings.manual_resource_ids || '')
+    .split(/\r?\n|,/)
+    .map(s => s.trim())
+    .filter(Boolean)
+}
+
+function hasManualDingTalkResourceIds(): boolean {
+  return getManualDingTalkResourceLines().length > 0
+}
+
+function normalizeManualDingTalkResourceIDs(): string[] {
+  const type = getDingTalkType()
+  return getManualDingTalkResourceLines().map((raw) => {
+    if (raw.startsWith('wiki:') || raw.startsWith('space:')) return raw
+    return type === 'wiki' ? `wiki:${raw}` : `space:${raw}`
+  })
+}
+
+function isDingTalkResourceIDForCurrentType(id: string): boolean {
+  if (form.value.type !== 'dingtalk') return true
+  return getDingTalkType() === 'wiki' ? id.startsWith('wiki:') : id.startsWith('space:')
+}
+
+function validateManualDingTalkResourceIds(): boolean {
+  if (form.value.type !== 'dingtalk' || !hasManualDingTalkResourceIds()) return true
+  const type = getDingTalkType()
+  for (const raw of getManualDingTalkResourceLines()) {
+    if (/^https?:\/\//i.test(raw)) {
+      MessagePlugin.warning(t('datasource.dingtalk.manualIdUrlWarning'))
+      return false
+    }
+    if (type === 'wiki' && raw.startsWith('space:')) {
+      MessagePlugin.warning(t('datasource.dingtalk.manualIdTypeMismatchWiki'))
+      return false
+    }
+    if (type === 'drive' && raw.startsWith('wiki:')) {
+      MessagePlugin.warning(t('datasource.dingtalk.manualIdTypeMismatchDrive'))
+      return false
+    }
+  }
+  return true
+}
+
+function getResourceIdsForPayload(): string[] {
+  if (form.value.type === 'dingtalk' && hasManualDingTalkResourceIds()) {
+    return normalizeManualDingTalkResourceIDs()
+  }
+  if (form.value.type === 'dingtalk') {
+    return selectedResourceIds.value.filter(isDingTalkResourceIDForCurrentType)
+  }
+  return selectedResourceIds.value
 }
 
 // --- Test connection (stateless, no DB write) ---
 async function testConnection() {
   syncRssAuthHeadersToCredentials()
   if (!validateRssFeedUrls()) return
+  ensureDingTalkSettings()
+  if (form.value.type === 'dingtalk' && !String(form.value.config.settings.union_id || '').trim()) {
+    MessagePlugin.warning(`${t('datasource.field.operatorUnionId')} ${t('datasource.isRequired')}`)
+    return
+  }
+  if (!validateManualDingTalkResourceIds()) return
   if (!isEdit.value || !credentialsConfigured.value || replaceCredentialsMode.value) {
     const fields = currentDef.value?.fields || []
     for (const f of fields) {
@@ -553,16 +701,30 @@ async function testConnection() {
   testErrorMsg.value = ''
   try {
     if (isEdit.value && tempDsId.value) {
+      form.value.config.resource_ids = getResourceIdsForPayload()
       await updateDataSource(tempDsId.value, {
         ...form.value,
+        config: buildConfigPayload(),
         knowledge_base_id: props.kbId,
       } as any)
-      await validateConnection(tempDsId.value)
+      if (credentialsInputVisible.value) {
+        const credsOk = await commitCredentialsIfNeeded(tempDsId.value)
+        if (!credsOk) {
+          testResult.value = 'error'
+          testing.value = false
+          return
+        }
+      } else {
+        await validateConnection(tempDsId.value)
+      }
     } else {
       const creds = { ...form.value.config.credentials }
       if (form.value.type === 'rss') {
         // validate-credentials is credentials-only; feed URLs live in settings.
         creds.feed_urls = form.value.config.settings.feed_urls
+      } else if (form.value.type === 'dingtalk') {
+        creds.union_id = form.value.config.settings.union_id
+        creds.dingtalk_type = form.value.config.settings.dingtalk_type
       }
       await validateCredentials(form.value.type, creds)
     }
@@ -597,6 +759,15 @@ async function loadResources() {
 
     const res = await listResources(tempDsId.value)
     resources.value = res?.data || res || []
+    if (form.value.type === 'dingtalk') {
+      const knownRootIds = new Set(resources.value.filter(r => !r.parent_id).map(r => r.external_id))
+      selectedResourceIds.value = selectedResourceIds.value.filter((id) => {
+        if (!isDingTalkResourceIDForCurrentType(id)) return false
+        if (knownRootIds.has(id)) return true
+        const rootID = getDingTalkRootResourceID(id)
+        return rootID ? knownRootIds.has(rootID) : true
+      })
+    }
     // Any parent that already arrived with children (connectors returning the
     // full tree, e.g. Notion) needs no further lazy fetch.
     const parentsWithChildren = new Set<string>()
@@ -636,7 +807,13 @@ async function revealExistingSelections(hiddenIds: string[]) {
   try {
     const res = await resolveResourceAncestors(tempDsId.value, hiddenIds)
     const ancestors: string[] = res?.data?.ancestors || res?.ancestors || []
-    if (ancestors.length === 0) return
+    if (ancestors.length === 0) {
+      if (form.value.type === 'dingtalk') {
+        const hidden = new Set(hiddenIds)
+        selectedResourceIds.value = selectedResourceIds.value.filter(id => !hidden.has(id))
+      }
+      return
+    }
     const expanded = new Set(expandedResourceIds.value)
     for (const id of ancestors) expanded.add(id)
     expandedResourceIds.value = expanded
@@ -730,6 +907,12 @@ function validateRssFeedUrls(): boolean {
 function validateStep1Fields(): boolean {
   syncRssAuthHeadersToCredentials()
   if (!validateRssFeedUrls()) return false
+  ensureDingTalkSettings()
+  if (form.value.type === 'dingtalk' && !String(form.value.config.settings.union_id || '').trim()) {
+    MessagePlugin.warning(`${t('datasource.field.operatorUnionId')} ${t('datasource.isRequired')}`)
+    return false
+  }
+  if (!validateManualDingTalkResourceIds()) return false
   if (isEdit.value && credentialsConfigured.value && !replaceCredentialsMode.value) {
     return true
   }
@@ -748,10 +931,18 @@ function validateStep1Fields(): boolean {
 async function nextStep() {
   if (step.value === 1) {
     if (!validateStep1Fields()) return
-    if (needsConnectionTest() && testResult.value !== 'success') {
+    if (needsConnectionTest() && testResult.value !== 'success' && !hasManualDingTalkResourceIds()) {
       await testConnection()
       if (testResult.value !== 'success') return
     }
+    if (hasManualDingTalkResourceIds()) {
+      step.value = 3
+      return
+    }
+  }
+  if (step.value === 2 && getResourceIdsForPayload().length === 0) {
+    MessagePlugin.warning(t('datasource.resourceRequired'))
+    return
   }
   step.value++
   if (step.value === 2) {
@@ -773,9 +964,10 @@ function prevStep() {
 // commitCredentialsIfNeeded). Sending an empty map keeps the backend
 // validator happy.
 function buildConfigPayload(): Record<string, unknown> {
+  ensureDingTalkSettings()
   return {
     credentials: isEdit.value ? {} : { ...form.value.config.credentials },
-    resource_ids: form.value.config.resource_ids,
+    resource_ids: getResourceIdsForPayload(),
     settings: form.value.config.settings,
   }
 }
@@ -784,7 +976,7 @@ function buildConfigPayload(): Record<string, unknown> {
 // least one value, commit it to /credentials before the main PUT. Aborts
 // the whole submit on failure so we don't leave the row partially saved.
 async function commitCredentialsIfNeeded(dsId: string): Promise<boolean> {
-  if (!isEdit.value || !replaceCredentialsMode.value) return true
+  if (!isEdit.value || (!replaceCredentialsMode.value && credentialsConfigured.value)) return true
   syncRssAuthHeadersToCredentials()
   const filled = Object.entries(form.value.config.credentials).filter(
     ([, v]) => typeof v === 'string' ? v !== '' : v != null,
@@ -805,7 +997,7 @@ async function commitCredentialsIfNeeded(dsId: string): Promise<boolean> {
 
 // --- Final submit ---
 async function handleSubmit() {
-  form.value.config.resource_ids = selectedResourceIds.value
+  form.value.config.resource_ids = getResourceIdsForPayload()
   submitting.value = true
   try {
     let dataSourceId = tempDsId.value
@@ -1147,6 +1339,64 @@ const drawerConfirmText = computed(() => {
             spellcheck="false"
           />
           <p class="form-desc">{{ t('datasource.field.feedUrlsHint') }}</p>
+        </div>
+      </section>
+
+      <section v-if="form.type === 'dingtalk'" class="setting-drawer__section">
+        <h4 class="setting-drawer__section-title">{{ t('datasource.dingtalk.section') }}</h4>
+        <div class="form-item form-item--flat">
+          <label class="form-label required">{{ t('datasource.dingtalk.typeLabel') }}</label>
+          <div class="option-group" role="radiogroup" :aria-label="t('datasource.dingtalk.typeLabel')">
+            <button
+              type="button"
+              class="option-pill"
+              :class="{ 'is-active': form.config.settings.dingtalk_type !== 'wiki' }"
+              role="radio"
+              :aria-checked="form.config.settings.dingtalk_type !== 'wiki'"
+              @click="setDingTalkType('drive')"
+            >
+              {{ t('datasource.dingtalk.drive') }}
+            </button>
+            <button
+              type="button"
+              class="option-pill"
+              :class="{ 'is-active': form.config.settings.dingtalk_type === 'wiki' }"
+              role="radio"
+              :aria-checked="form.config.settings.dingtalk_type === 'wiki'"
+              @click="setDingTalkType('wiki')"
+            >
+              {{ t('datasource.dingtalk.wiki') }}
+            </button>
+          </div>
+        </div>
+        <div class="form-item">
+          <label class="form-label required">{{ t('datasource.field.operatorUnionId') }}</label>
+          <t-input
+            v-model="form.config.settings.union_id"
+            :placeholder="t('credential.inputPlaceholder')"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p class="form-desc">{{ t('datasource.dingtalk.unionIdHint') }}</p>
+        </div>
+        <div class="form-item">
+          <label class="form-label">{{ t('datasource.dingtalk.manualResourceIds') }}</label>
+          <t-textarea
+            v-model="form.config.settings.manual_resource_ids"
+            :placeholder="form.config.settings.dingtalk_type === 'wiki'
+              ? 'KEvB1SAgyDL3yLa5'
+              : '29148929920'"
+            :autosize="{ minRows: 2, maxRows: 5 }"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p class="form-desc">{{ t('datasource.dingtalk.manualResourceIdsHint') }}</p>
+          <div v-if="hasManualDingTalkResourceIds()" class="inline-alert inline-alert--compact">
+            <t-icon name="info-circle-filled" class="inline-alert__icon" />
+            <span class="inline-alert__text">
+              {{ t('datasource.dingtalk.manualModeHint') }}
+            </span>
+          </div>
         </div>
       </section>
 
@@ -1641,6 +1891,15 @@ const drawerConfirmText = computed(() => {
 
 .inline-alert__action:hover {
   color: var(--td-brand-color-active);
+}
+
+.inline-alert--compact {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--td-component-border);
+  border-radius: 6px;
+  background: var(--td-bg-color-container-hover);
+  font-size: 12px;
 }
 
 .ds-setup-guide {

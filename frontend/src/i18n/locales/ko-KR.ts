@@ -5658,6 +5658,7 @@ export default {
       startTime: "시작 시간",
       endTime: "종료 시간",
       duration: "소요 시간",
+      skippedReason: "건너뛴 이유",
     },
     connector: {
       feishu: "페이슈 (Feishu)",

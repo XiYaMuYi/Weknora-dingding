@@ -5480,6 +5480,7 @@ export default {
       startTime: 'Время начала',
       endTime: 'Время окончания',
       duration: 'Длительность',
+      skippedReason: 'Причина пропуска',
     },
     connector: {
       feishu: 'Feishu (Фэйшу)',

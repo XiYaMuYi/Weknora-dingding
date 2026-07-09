@@ -38,6 +38,10 @@ export interface SyncLog {
   items_skipped: number
   items_failed: number
   error_message: string
+  result?: {
+    skipped_details?: string[]
+    errors?: string[]
+  }
 }
 
 export interface ConnectorMeta {

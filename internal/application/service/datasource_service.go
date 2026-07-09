@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -725,6 +726,9 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 			} else {
 				logger.Infof(ctx, "skipping item %q (external_id=%s): no content or URL", item.Title, item.ExternalID)
 				result.Skipped++
+				if reason := strings.TrimSpace(item.Metadata["skip_reason"]); reason != "" {
+					result.SkippedDetails = append(result.SkippedDetails, fmt.Sprintf("%s: %s", item.Title, reason))
+				}
 			}
 			continue
 		}
@@ -752,7 +756,7 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 	if err := allFetchedItemsFailedError(result); err != nil {
 		logger.Errorf(ctx, "data source sync failed while processing fetched items: %v", err)
 		s.updateSyncRunResult(ctx, ds, syncLog, result, resultJSON, types.SyncLogStatusFailed, err.Error(), wasPaused)
-		return err
+		return nil
 	}
 
 	// Update cursor for next incremental sync
@@ -762,11 +766,8 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 	}
 
 	ds.LastSyncAt = timePtr(time.Now().UTC())
-	syncStatus := types.SyncLogStatusSuccess
-	syncErrorMessage := ""
+	syncStatus, syncErrorMessage := syncRunStatusForResult(result, fetchWarnings)
 	if len(fetchWarnings) > 0 {
-		syncStatus = types.SyncLogStatusPartial
-		syncErrorMessage = fmt.Sprintf("Some feeds failed: %s", strings.Join(fetchWarnings, "; "))
 		for _, w := range fetchWarnings {
 			result.Errors = append(result.Errors, w)
 		}
@@ -778,6 +779,19 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 		payload.DataSourceID, syncLog.ItemsCreated, syncLog.ItemsUpdated, syncLog.ItemsDeleted)
 
 	return nil
+}
+
+func syncRunStatusForResult(result *types.SyncResult, fetchWarnings []string) (string, string) {
+	if len(fetchWarnings) > 0 {
+		return types.SyncLogStatusPartial, fmt.Sprintf("Some feeds failed: %s", strings.Join(fetchWarnings, "; "))
+	}
+	if result != nil && result.Failed > 0 {
+		if len(result.Errors) > 0 {
+			return types.SyncLogStatusPartial, truncateUTF8(result.Errors[0], 500)
+		}
+		return types.SyncLogStatusPartial, fmt.Sprintf("%d item(s) failed during sync", result.Failed)
+	}
+	return types.SyncLogStatusSuccess, ""
 }
 
 func (s *DataSourceService) updateSyncRunResult(
@@ -833,14 +847,23 @@ func allFetchedItemsFailedError(result *types.SyncResult) error {
 	if len(result.Errors) > 0 {
 		detail = result.Errors[0]
 		const maxDetailLen = 500
-		if len(detail) > maxDetailLen {
-			detail = detail[:maxDetailLen] + "..."
-		}
+		detail = truncateUTF8(detail, maxDetailLen)
 	}
 	if detail == "" {
 		return fmt.Errorf("all fetched items failed during sync (%d/%d)", result.Failed, result.Total)
 	}
 	return fmt.Errorf("all fetched items failed during sync (%d/%d): %s", result.Failed, result.Total, detail)
+}
+
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	truncated := s[:maxBytes]
+	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated + "..."
 }
 
 // ValidateCredentials tests connectivity using raw credentials without persisting anything.

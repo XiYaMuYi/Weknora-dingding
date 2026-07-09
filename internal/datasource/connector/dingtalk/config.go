@@ -27,14 +27,41 @@ func parseDingTalkConfig(config *types.DataSourceConfig) (*Config, Settings, err
 	if cfg.AppKey == "" {
 		cfg.AppKey = stringFromMap(config.Credentials, "client_id")
 	}
+	if cfg.AppKey == "" {
+		cfg.AppKey = stringFromMap(config.Credentials, "app_id")
+	}
 	if cfg.AppSecret == "" {
 		cfg.AppSecret = stringFromMap(config.Credentials, "client_secret")
 	}
 	if cfg.AppKey == "" || cfg.AppSecret == "" {
 		return nil, Settings{}, fmt.Errorf("dingtalk app_key and app_secret are required")
 	}
-
 	settings := parseSettings(config.Settings)
+	if settings.DingTalkType == "" || settings.DingTalkType == "drive" {
+		if v := stringFromMap(config.Credentials, "dingtalk_type"); v == "wiki" {
+			settings.DingTalkType = "wiki"
+		}
+	}
+	if cfg.OperatorUnionID == "" {
+		cfg.OperatorUnionID = settings.OperatorUnionID
+	}
+	if cfg.OperatorUnionID == "" {
+		cfg.OperatorUnionID = stringFromMap(config.Credentials, "union_id")
+	}
+	if cfg.OperatorUnionID == "" {
+		cfg.OperatorUnionID = stringFromMap(config.Credentials, "operator_union_id")
+	}
+	if cfg.OperatorUnionID == "" {
+		cfg.OperatorUnionID = stringFromMap(config.Credentials, "unionId")
+	}
+	if cfg.OperatorUnionID == "" {
+		cfg.OperatorUnionID = cfg.CorpID
+	}
+	if cfg.OperatorUnionID == "" {
+		return nil, Settings{}, fmt.Errorf("dingtalk operator union_id is required")
+	}
+	settings.OperatorUnionID = cfg.OperatorUnionID
+
 	return &cfg, settings, nil
 }
 

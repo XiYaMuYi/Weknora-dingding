@@ -256,6 +256,27 @@ func (d *DataSourceConfig) StripNonSecretCredentials(connectorType string) {
 		if len(d.Credentials) == 0 {
 			d.Credentials = nil
 		}
+	case ConnectorTypeDingTalk:
+		if d.Settings == nil {
+			d.Settings = map[string]interface{}{}
+		}
+		if v, ok := d.Credentials["dingtalk_type"]; ok {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				d.Settings["dingtalk_type"] = strings.TrimSpace(s)
+			}
+			delete(d.Credentials, "dingtalk_type")
+		}
+		for _, key := range []string{"union_id", "operator_union_id", "unionId", "corp_id"} {
+			if v, ok := d.Credentials[key]; ok {
+				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+					d.Settings["union_id"] = strings.TrimSpace(s)
+				}
+				delete(d.Credentials, key)
+			}
+		}
+		if len(d.Credentials) == 0 {
+			d.Credentials = nil
+		}
 	}
 }
 
@@ -357,6 +378,9 @@ type SyncResult struct {
 
 	// Detailed error messages
 	Errors []string `json:"errors,omitempty"`
+
+	// Detailed skip messages for intentionally unsupported or unchanged items
+	SkippedDetails []string `json:"skipped_details,omitempty"`
 
 	// Updated cursor for next incremental sync
 	NextCursor *SyncCursor `json:"next_cursor,omitempty"`

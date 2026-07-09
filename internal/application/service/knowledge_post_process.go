@@ -228,8 +228,9 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		// Nothing to enrich — fast path keeps the previous behavior so
 		// users without summary/question/graph see 'completed' immediately.
 		updates := map[string]interface{}{
-			"parse_status": types.ParseStatusCompleted,
-			"updated_at":   time.Now(),
+			"parse_status":  types.ParseStatusCompleted,
+			"error_message": "",
+			"updated_at":    time.Now(),
 		}
 		if len(textChunks) > 0 {
 			updates["summary_status"] = types.SummaryStatusNone

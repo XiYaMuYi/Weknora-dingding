@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -174,6 +175,17 @@ func TestAllFetchedItemsFailedErrorIgnoresSkippedItems(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestSyncRunStatusIsPartialWhenSomeItemsFail(t *testing.T) {
+	status, message := syncRunStatusForResult(&types.SyncResult{
+		Total:   2,
+		Skipped: 1,
+		Failed:  1,
+		Errors:  []string{"在线测试表.axls: Target document should be doc"},
+	}, nil)
+	require.Equal(t, types.SyncLogStatusPartial, status)
+	assert.Contains(t, message, "在线测试表.axls")
+}
+
 func TestAllFetchedItemsFailedErrorTruncatesLongDetail(t *testing.T) {
 	err := allFetchedItemsFailedError(&types.SyncResult{
 		Total:  1,
@@ -182,5 +194,16 @@ func TestAllFetchedItemsFailedErrorTruncatesLongDetail(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.LessOrEqual(t, len(err.Error()), 560)
+	assert.Contains(t, err.Error(), "...")
+}
+
+func TestAllFetchedItemsFailedErrorTruncatesUTF8Safely(t *testing.T) {
+	err := allFetchedItemsFailedError(&types.SyncResult{
+		Total:  1,
+		Failed: 1,
+		Errors: []string{strings.Repeat("权限不足。", 120)},
+	})
+	require.Error(t, err)
+	assert.True(t, utf8.ValidString(err.Error()))
 	assert.Contains(t, err.Error(), "...")
 }

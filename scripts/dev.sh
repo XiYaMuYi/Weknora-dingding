@@ -398,6 +398,13 @@ start_frontend() {
         log_warning "node_modules 不存在，正在安装依赖..."
         npm install
     fi
+
+    if [ -f ".env.local" ]; then
+        set -a
+        # shellcheck source=/dev/null
+        source .env.local
+        set +a
+    fi
     
     log_info "启动 Vite 开发服务器..."
     log_info "前端将运行在 http://localhost:5173"
