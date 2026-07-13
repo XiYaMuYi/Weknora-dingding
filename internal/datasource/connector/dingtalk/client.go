@@ -330,7 +330,7 @@ func (c *Client) DownloadDocContent(ctx context.Context, spaceID, dentryID, name
 		return nil, "", err
 	}
 
-	if isDingTalkNativeOnlineDocExtension(extension) {
+	if isDriveNativeOnlineDocExtension(extension) {
 		return c.downloadViaExportFallback(ctx, token, spaceID, dentryID, name, extension, nil)
 	}
 

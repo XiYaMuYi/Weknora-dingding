@@ -134,6 +134,7 @@ export default defineConfig(({ mode }) => {
   server: {
     port: 5173,
     host: true,
+    allowedHosts: true, // 允许所有主机访问（ngrok 穿透需要）
     // 代理配置，用于开发环境
     proxy: {
       '/api': {

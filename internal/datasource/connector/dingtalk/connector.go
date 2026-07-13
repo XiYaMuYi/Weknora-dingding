@@ -518,22 +518,23 @@ func normalizeWikiDocumentKind(n wikiNodeItem) dingtalkDocumentKind {
 		return dingtalkDocumentKindUnsupported
 	}
 	category := strings.ToUpper(strings.TrimSpace(n.Category))
+	nameExt := wikiNodeNameExtension(n)
 	ext := extensionFromWikiNode(n)
 	if hasWikiUploadedFileLocator(n) {
 		return dingtalkDocumentKindUploadedFile
 	}
-	if isDingTalkNativeSpreadsheetExtension(ext) {
+	if isDingTalkNativeSpreadsheetExtension(nameExt) {
 		return dingtalkDocumentKindNativeSheet
 	}
-	if ext != "" && isDingTalkNativeOnlineDocExtension(ext) {
+	if nameExt != "" && isDingTalkNativeOnlineDocExtension(nameExt) {
 		return dingtalkDocumentKindNativeDoc
 	}
 	switch category {
 	case "ALIDOC", "DOC", "DOCUMENT":
-		if ext == "xlsx" || ext == "xls" {
+		if isSupportedUploadedFileExtension(nameExt) {
 			return dingtalkDocumentKindUploadedFile
 		}
-		if ext != "" {
+		if nameExt != "" {
 			return dingtalkDocumentKindSkipped
 		}
 		return dingtalkDocumentKindNativeDoc
@@ -903,7 +904,7 @@ func isSyncableDriveDentry(d dentryItem) bool {
 }
 
 func driveDocumentKind(d dentryItem) dingtalkDocumentKind {
-	if isDingTalkNativeOnlineDocExtension(d.Extension) {
+	if isDriveNativeOnlineDocExtension(d.Extension) {
 		return dingtalkDocumentKindNativeDoc
 	}
 	return dingtalkDocumentKindUploadedFile
@@ -954,9 +955,8 @@ func wikiRevisionKey(n wikiNodeItem) string {
 }
 
 func extensionFromWikiNode(n wikiNodeItem) string {
-	name := strings.ToLower(n.Name)
-	if idx := strings.LastIndex(name, "."); idx >= 0 && idx < len(name)-1 {
-		return name[idx+1:]
+	if ext := wikiNodeNameExtension(n); ext != "" {
+		return ext
 	}
 	switch strings.ToUpper(n.Category) {
 	case "ALIDOC", "DOC":
@@ -966,6 +966,14 @@ func extensionFromWikiNode(n wikiNodeItem) string {
 	default:
 		return ""
 	}
+}
+
+func wikiNodeNameExtension(n wikiNodeItem) string {
+	name := strings.ToLower(strings.TrimSpace(n.Name))
+	if idx := strings.LastIndex(name, "."); idx >= 0 && idx < len(name)-1 {
+		return name[idx+1:]
+	}
+	return ""
 }
 
 func parseUpdatedTime(raw string) time.Time {
@@ -1011,7 +1019,17 @@ func markdownFileName(name string) string {
 func isDingTalkNativeOnlineDocExtension(extension string) bool {
 	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
 	switch ext {
-	case "", "adoc", "doc", "docx", "md", "markdown", "mark", "txt":
+	case "", "adoc":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDriveNativeOnlineDocExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	switch ext {
+	case "", "doc", "docx", "adoc", "markdown", "md":
 		return true
 	default:
 		return false
