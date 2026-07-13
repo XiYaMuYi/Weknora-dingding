@@ -1,4 +1,4 @@
-.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs install-swagger build-lite run-lite package-lite
+.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs install-swagger build-lite run-lite package-lite production-preflight production-status production-backup production-deploy
 
 # Show help
 help:
@@ -63,6 +63,12 @@ help:
 	@echo "  run-lite          构建并启动 Lite 版本"
 	@echo "  package-lite      构建并打包 Lite 发行包（tarball）"
 	@echo "  package-mac-app   构建并打包 macOS 桌面应用 (.app)"
+	@echo ""
+	@echo "生产操作:"
+	@echo "  production-preflight  检查生产配置和单 App 实例限制"
+	@echo "  production-status     显示生产服务状态和待处理文档"
+	@echo "  production-backup     创建 PostgreSQL 和文件卷备份（dir=/absolute/backup/path）"
+	@echo "  production-deploy     预检后启动生产 Compose 服务"
 
 # Go related variables
 BINARY_NAME=WeKnora
@@ -332,4 +338,16 @@ dev-app:
 dev-frontend:
 	./scripts/dev.sh frontend
 
+production-preflight:
+	./scripts/production.sh preflight
+
+production-status:
+	./scripts/production.sh status
+
+production-backup:
+	@test -n "$(dir)" || (echo "Usage: make production-backup dir=/absolute/backup/path" && exit 1)
+	./scripts/production.sh backup "$(dir)"
+
+production-deploy:
+	./scripts/production.sh deploy
 

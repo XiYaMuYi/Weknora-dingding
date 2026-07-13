@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT/deploy/production/.env.production.example"
 OVERRIDE_FILE="$ROOT/deploy/production/docker-compose.production.yml"
 
+test -x "$ROOT/scripts/production.sh"
 test -f "$ENV_FILE"
 test -f "$OVERRIDE_FILE"
 
@@ -26,3 +27,8 @@ grep -Eq 'WEKNORA_ASYNQ_CONCURRENCY(: "?2"?|=2)' "$rendered"
 grep -Eq 'CONCURRENCY_POOL_SIZE(: "?1"?|=1)' "$rendered"
 grep -Eq '127\.0\.0\.1:|host_ip: 127\.0\.0\.1' "$rendered"
 grep -Eq 'max-size: "?20m"?' "$rendered"
+
+if ./scripts/production.sh preflight --env-file /tmp/does-not-exist; then
+  echo "preflight unexpectedly accepted a missing environment file" >&2
+  exit 1
+fi
