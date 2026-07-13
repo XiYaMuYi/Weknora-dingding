@@ -41,7 +41,13 @@ rg -F 'make production-status' "$RUNBOOK" >/dev/null
 rg -F 'make production-backup dir=/absolute/backup/path' "$RUNBOOK" >/dev/null
 rg -F 'WEKNORA_ASYNQ_CONCURRENCY=2' "$RUNBOOK" >/dev/null
 
-if [[ "$(rg -F -c 'docker compose down -v' "$RUNBOOK")" != '1' ]]; then
+synthetic_down_count="$(printf '%s\n' 'docker compose down -v; docker compose down -v' | rg -o -F 'docker compose down -v' | wc -l | tr -d '[:space:]')"
+if [[ "$synthetic_down_count" != '2' ]]; then
+  echo 'docker compose down -v occurrence counting must distinguish two matches on one line' >&2
+  exit 1
+fi
+
+if [[ "$(rg -o -F 'docker compose down -v' "$RUNBOOK" | wc -l | tr -d '[:space:]')" != '1' ]]; then
   echo 'docker compose down -v must appear exactly once in the production runbook' >&2
   exit 1
 fi
