@@ -28,7 +28,15 @@ grep -Eq 'CONCURRENCY_POOL_SIZE(: "?1"?|=1)' "$rendered"
 grep -Eq '127\.0\.0\.1:|host_ip: 127\.0\.0\.1' "$rendered"
 grep -Eq 'max-size: "?20m"?' "$rendered"
 
-if "$ROOT/scripts/production.sh" preflight --env-file /tmp/does-not-exist; then
+if "$ROOT/scripts/production.sh" preflight --env-file /tmp/does-not-exist >/dev/null 2>&1; then
   echo "preflight unexpectedly accepted a missing environment file" >&2
   exit 1
 fi
+
+test -f "$ROOT/docs/生产环境配置说明.md"
+rg -F 'make production-preflight' "$ROOT/docs/生产环境配置说明.md" >/dev/null
+rg -F 'make production-deploy' "$ROOT/docs/生产环境配置说明.md" >/dev/null
+rg -F 'make production-status' "$ROOT/docs/生产环境配置说明.md" >/dev/null
+rg -F 'make production-backup dir=/absolute/backup/path' "$ROOT/docs/生产环境配置说明.md" >/dev/null
+rg -F 'WEKNORA_ASYNQ_CONCURRENCY=2' "$ROOT/docs/生产环境配置说明.md" >/dev/null
+rg -F 'docker compose down -v' "$ROOT/docs/生产环境配置说明.md" >/dev/null
