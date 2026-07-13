@@ -1,0 +1,36 @@
+# app 不能使用 --scale app；当前进程同时运行 API 和 Asynq Worker。
+# 资源数值是单机 8 核/16 GB 起步的上限，Ollama 不在该 Compose 内，必须有自己的容量预算。
+services:
+  frontend:
+    logging: &json_logs
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  app:
+    environment:
+      WEKNORA_ASYNQ_CONCURRENCY: "2"
+      CONCURRENCY_POOL_SIZE: "1"
+    mem_limit: 4g
+    cpus: 2.0
+    logging: *json_logs
+
+  docreader:
+    environment:
+      DOCREADER_ODL_MAX_WORKERS: "1"
+      DOCREADER_MARKITDOWN_MAX_WORKERS: "1"
+      DOCREADER_PDF_RENDER_MAX_WORKERS: "1"
+    mem_limit: 4g
+    cpus: 2.0
+    logging: *json_logs
+
+  postgres:
+    mem_limit: 4g
+    cpus: 2.0
+    logging: *json_logs
+
+  redis:
+    mem_limit: 1g
+    cpus: 1.0
+    logging: *json_logs

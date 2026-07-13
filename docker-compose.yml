@@ -6,7 +6,7 @@ services:
       context: ./frontend
     container_name: WeKnora-frontend
     ports:
-      - "${FRONTEND_PORT:-80}:80"
+      - "${FRONTEND_BIND:-0.0.0.0}:${FRONTEND_PORT:-80}:80"
     environment:
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
       - APP_HOST=${APP_HOST:-app}
@@ -34,7 +34,7 @@ services:
         - GOPROXY_ARG=${GOPROXY_ARG:-https://goproxy.cn,direct}
     container_name: WeKnora-app
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${APP_BIND:-0.0.0.0}:${APP_PORT:-8080}:8080"
     volumes:
       - data-files:/data/files
       - docreader-tmp:/tmp/docreader:ro
@@ -62,7 +62,7 @@ services:
     # absent — see scripts/start_all.sh for the pre-flight touch that keeps
     # fresh clones working.
     env_file:
-      - .env
+      - ${WEKNORA_ENV_FILE:-.env}
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-}
       - COS_SECRET_ID=${COS_SECRET_ID:-}
@@ -298,6 +298,8 @@ services:
       - POSTGRES_DB=${DB_NAME}
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${DB_BIND:-0.0.0.0}:${DB_PORT:-5432}:5432"
     networks:
       - WeKnora-network
     healthcheck:
@@ -314,6 +316,8 @@ services:
     image: redis:7.0-alpine
     container_name: WeKnora-redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "${REDIS_BIND:-0.0.0.0}:${REDIS_PORT:-6379}:6379"
     restart: always
     networks:
       - WeKnora-network
