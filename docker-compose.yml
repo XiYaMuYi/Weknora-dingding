@@ -316,6 +316,8 @@ services:
     image: redis:7.0-alpine
     container_name: WeKnora-redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
     ports:
       - "${REDIS_BIND:-0.0.0.0}:${REDIS_PORT:-6379}:6379"
     restart: always
@@ -794,6 +796,7 @@ networks:
 
 volumes:
   postgres-data:
+  redis-data:
   data-files:
   docreader-tmp:
   minio_data:

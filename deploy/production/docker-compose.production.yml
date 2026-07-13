@@ -2,6 +2,8 @@
 # 资源数值是单机 8 核/16 GB 起步的上限，Ollama 不在该 Compose 内，必须有自己的容量预算。
 services:
   frontend:
+    mem_limit: 512m
+    cpus: 0.5
     logging: &json_logs
       driver: local
       options:
