@@ -28,7 +28,7 @@ grep -Eq 'CONCURRENCY_POOL_SIZE(: "?1"?|=1)' "$rendered"
 grep -Eq '127\.0\.0\.1:|host_ip: 127\.0\.0\.1' "$rendered"
 grep -Eq 'max-size: "?20m"?' "$rendered"
 
-if ./scripts/production.sh preflight --env-file /tmp/does-not-exist; then
+if "$ROOT/scripts/production.sh" preflight --env-file /tmp/does-not-exist; then
   echo "preflight unexpectedly accepted a missing environment file" >&2
   exit 1
 fi
