@@ -34,9 +34,33 @@ if "$ROOT/scripts/production.sh" preflight --env-file /tmp/does-not-exist >/dev/
 fi
 
 test -f "$ROOT/docs/生产环境配置说明.md"
-rg -F 'make production-preflight' "$ROOT/docs/生产环境配置说明.md" >/dev/null
-rg -F 'make production-deploy' "$ROOT/docs/生产环境配置说明.md" >/dev/null
-rg -F 'make production-status' "$ROOT/docs/生产环境配置说明.md" >/dev/null
-rg -F 'make production-backup dir=/absolute/backup/path' "$ROOT/docs/生产环境配置说明.md" >/dev/null
-rg -F 'WEKNORA_ASYNQ_CONCURRENCY=2' "$ROOT/docs/生产环境配置说明.md" >/dev/null
-rg -F 'docker compose down -v' "$ROOT/docs/生产环境配置说明.md" >/dev/null
+RUNBOOK="$ROOT/docs/生产环境配置说明.md"
+rg -F 'make production-preflight' "$RUNBOOK" >/dev/null
+rg -F 'make production-deploy' "$RUNBOOK" >/dev/null
+rg -F 'make production-status' "$RUNBOOK" >/dev/null
+rg -F 'make production-backup dir=/absolute/backup/path' "$RUNBOOK" >/dev/null
+rg -F 'WEKNORA_ASYNQ_CONCURRENCY=2' "$RUNBOOK" >/dev/null
+
+if [[ "$(rg -F -c 'docker compose down -v' "$RUNBOOK")" != '1' ]]; then
+  echo 'docker compose down -v must appear exactly once in the production runbook' >&2
+  exit 1
+fi
+
+if ! awk '
+  /^#{2,}[[:space:]]+禁止命令[[:space:]]*$/ {
+    in_prohibited_section = 1
+    next
+  }
+  in_prohibited_section && /^#{1,3}[[:space:]]/ {
+    in_prohibited_section = 0
+  }
+  in_prohibited_section && /docker compose down -v/ {
+    found_in_prohibited_section = 1
+  }
+  END {
+    exit(found_in_prohibited_section ? 0 : 1)
+  }
+' "$RUNBOOK"; then
+  echo 'docker compose down -v must appear in the 禁止命令 section' >&2
+  exit 1
+fi
