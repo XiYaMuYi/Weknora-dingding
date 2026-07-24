@@ -133,6 +133,91 @@ func TestDownloadWikiDocContent_downloadsBackingDentryAsDOCX(t *testing.T) {
 	}
 }
 
+func TestDownloadWikiDocContent_resolveFailureDoesNotFallbackToBlocks(t *testing.T) {
+	blocksCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/dentries/doc-key/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		writeJSON(w, map[string]string{
+			"code":      "Forbidden.ResolveDenied",
+			"message":   "resolve denied",
+			"requestid": "resolve-request-1",
+		})
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		blocksCalls++
+		writeJSON(w, map[string]interface{}{"blocks": []interface{}{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	_, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err == nil {
+		t.Fatal("DownloadWikiDocContent() error = nil")
+	}
+	if blocksCalls != 0 {
+		t.Fatalf("blocks calls = %d, want 0", blocksCalls)
+	}
+	for _, want := range []string{"解析钉钉文档下载标识失败", "Forbidden.ResolveDenied", "resolve-request-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestDownloadWikiDocContent_downloadFailureDoesNotFallbackToBlocks(t *testing.T) {
+	blocksCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/dentries/doc-key/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, dentryIDByUUIDResponse{SpaceID: "space-1", DentryID: "dentry-1"})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/space-1/dentries/dentry-1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		writeJSON(w, map[string]string{
+			"code":      "Forbidden.DownloadDenied",
+			"message":   "download denied",
+			"requestId": "download-request-1",
+		})
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		blocksCalls++
+		writeJSON(w, map[string]interface{}{"blocks": []interface{}{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	_, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err == nil {
+		t.Fatal("DownloadWikiDocContent() error = nil")
+	}
+	if blocksCalls != 0 {
+		t.Fatalf("blocks calls = %d, want 0", blocksCalls)
+	}
+	for _, want := range []string{"下载钉钉完整文档失败", "Forbidden.DownloadDenied", "download-request-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
 func fakeDingTalkServer(dentries []dentryItem) (*httptest.Server, *Config) {
 	mux := http.NewServeMux()
 
@@ -182,8 +267,10 @@ func fakeDingTalkServer(dentries []dentryItem) (*httptest.Server, *Config) {
 	return srv, cfg
 }
 
-func fakeDingTalkWikiServer(nodes []wikiNodeItem) (*httptest.Server, *Config) {
+func fakeDingTalkWikiServer(t *testing.T, nodes []wikiNodeItem) (*httptest.Server, *Config) {
+	t.Helper()
 	mux := http.NewServeMux()
+	var srv *httptest.Server
 
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
@@ -233,6 +320,29 @@ func fakeDingTalkWikiServer(nodes []wikiNodeItem) (*httptest.Server, *Config) {
 			},
 		})
 	})
+	mux.HandleFunc("/v2.0/doc/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		docKey := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2.0/doc/dentries/"), "/queryDentryId")
+		writeJSON(w, dentryIDByUUIDResponse{
+			DentryUUID: docKey,
+			DentryID:   "backing-" + docKey,
+			SpaceID:    "wiki-space",
+		})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/wiki-space/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/downloadInfos/query") {
+			http.NotFound(w, r)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/backing-missing/") {
+			http.Error(w, `{"code":"DownloadFailed","message":"download unavailable"}`, http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/wiki.docx"})
+	})
+	mux.HandleFunc("/download/wiki.docx", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+		_, _ = w.Write(testDOCXBytes(t))
+	})
 	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("operatorId") != "operator" {
 			http.Error(w, `{"message":"missing operatorId"}`, http.StatusBadRequest)
@@ -267,7 +377,7 @@ func fakeDingTalkWikiServer(nodes []wikiNodeItem) (*httptest.Server, *Config) {
 		})
 	})
 
-	srv := httptest.NewServer(mux)
+	srv = httptest.NewServer(mux)
 	cfg := &Config{AppKey: "key", AppSecret: "secret", BaseURL: srv.URL}
 	return srv, cfg
 }
@@ -696,7 +806,7 @@ func TestListResources_wikiRootAndChildren(t *testing.T) {
 		Category:    "ALIDOC",
 		URL:         "https://alidocs.dingtalk.com/i/nodes/doc1",
 	}}
-	srv, cfg := fakeDingTalkWikiServer(nodes)
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
 	defer srv.Close()
 
 	conn := NewConnector()
@@ -737,7 +847,7 @@ func TestFetchIncremental_wikiFetchesChangedDoc(t *testing.T) {
 		URL:         "https://alidocs.dingtalk.com/i/nodes/doc1",
 		UpdatedTime: "2026-06-01T00:00:00Z",
 	}}
-	srv, cfg := fakeDingTalkWikiServer(nodes)
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -763,14 +873,14 @@ func TestFetchIncremental_wikiFetchesChangedDoc(t *testing.T) {
 	if items[0].Metadata["dingtalk_doc_type"] != "wiki" {
 		t.Fatalf("unexpected metadata: %+v", items[0].Metadata)
 	}
-	if items[0].FileName != "测试用.md" {
-		t.Fatalf("FileName = %q, want 测试用.md", items[0].FileName)
+	if items[0].FileName != "测试用.docx" {
+		t.Fatalf("FileName = %q, want 测试用.docx", items[0].FileName)
 	}
-	if items[0].ContentType != "text/markdown" {
-		t.Fatalf("ContentType = %q, want text/markdown", items[0].ContentType)
+	if items[0].ContentType != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+		t.Fatalf("ContentType = %q, want DOCX", items[0].ContentType)
 	}
-	if !strings.Contains(string(items[0].Content), "DingTalk wiki body") {
-		t.Fatalf("unexpected content: %s", string(items[0].Content))
+	if err := validateDOCX(items[0].Content); err != nil {
+		t.Fatalf("unexpected DOCX content: %v", err)
 	}
 }
 
@@ -784,7 +894,7 @@ func TestFetchIncremental_wikiSpreadsheetUsesWorkbookAPI(t *testing.T) {
 		URL:         "https://alidocs.dingtalk.com/i/nodes/sheet1",
 		UpdatedTime: "2026-06-01T00:00:00Z",
 	}}
-	srv, cfg := fakeDingTalkWikiServer(nodes)
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -831,7 +941,7 @@ func TestFetchIncremental_wikiDocumentCategoryAxlsUsesWorkbookAPI(t *testing.T) 
 		URL:         "https://alidocs.dingtalk.com/i/nodes/sheet1",
 		UpdatedTime: "2026-06-01T00:00:00Z",
 	}}
-	srv, cfg := fakeDingTalkWikiServer(nodes)
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -874,7 +984,7 @@ func TestFetchIncremental_wikiUnsupportedOnlineCreationIsSkipped(t *testing.T) {
 		Category:    "WHITEBOARD",
 		UpdatedTime: "2026-06-01T00:00:00Z",
 	}}
-	srv, cfg := fakeDingTalkWikiServer(nodes)
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -905,7 +1015,7 @@ func TestFetchIncremental_wikiUnsupportedOnlineCreationIsSkipped(t *testing.T) {
 	}
 }
 
-func TestFetchIncremental_failedItemDoesNotAdvanceCursor(t *testing.T) {
+func TestFetchIncremental_downloadFailureDoesNotAdvanceRevision(t *testing.T) {
 	nodes := []wikiNodeItem{{
 		NodeID:      "missing",
 		WorkspaceID: "wk1",
@@ -914,7 +1024,7 @@ func TestFetchIncremental_failedItemDoesNotAdvanceCursor(t *testing.T) {
 		Category:    "ALIDOC",
 		UpdatedTime: "2026-06-01T00:00:00Z",
 	}}
-	srv, cfg := fakeDingTalkWikiServer(nodes)
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
