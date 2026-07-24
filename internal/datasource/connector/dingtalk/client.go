@@ -432,6 +432,15 @@ func (c *Client) downloadViaExportFallback(ctx context.Context, token, spaceID, 
 }
 
 func (c *Client) DownloadWikiDocContent(ctx context.Context, docKey, name, extension string) ([]byte, string, error) {
+	// Native wiki documents may contain embedded media that the blocks API
+	// represents only as newline placeholders. Resolve the backing dentry and
+	// download the complete file first so the document parser can preserve the
+	// media and its positions.
+	if info, err := c.ResolveDentryIDByUUID(ctx, docKey); err == nil {
+		if data, fileName, downloadErr := c.DownloadDocContent(ctx, info.SpaceID, info.DentryID, name, "docx"); downloadErr == nil {
+			return data, fileName, nil
+		}
+	}
 	q := url.Values{}
 	q.Set("operatorId", c.cfg.OperatorUnionID)
 	path := fmt.Sprintf("/v1.0/doc/suites/documents/%s/blocks", url.PathEscape(docKey))
@@ -527,6 +536,50 @@ func (c *Client) GetWorkbookRange(ctx context.Context, workbookID, sheetID, rang
 }
 
 func extractDingTalkBlockText(v interface{}) string {
+	if root, ok := v.(map[string]interface{}); ok {
+		if blocks := dingTalkBlocks(root); len(blocks) > 0 {
+			parts := make([]string, 0, len(blocks))
+			for _, block := range blocks {
+				if part := extractDingTalkBlock(block); part != "" {
+					parts = append(parts, part)
+				}
+			}
+			return strings.Join(parts, "\n\n")
+		}
+	}
+
+	return extractDingTalkTextFields(v)
+}
+
+func dingTalkBlocks(root map[string]interface{}) []map[string]interface{} {
+	for _, key := range []string{"blocks", "data"} {
+		if blocks := interfaceMapSlice(root[key]); len(blocks) > 0 {
+			return blocks
+		}
+	}
+	if result, ok := root["result"].(map[string]interface{}); ok {
+		for _, key := range []string{"blocks", "data"} {
+			if blocks := interfaceMapSlice(result[key]); len(blocks) > 0 {
+				return blocks
+			}
+		}
+	}
+	return nil
+}
+
+func extractDingTalkBlock(v map[string]interface{}) string {
+	if table := mapField(v, "table"); table != nil || strings.EqualFold(stringField(v, "type"), "table") || strings.EqualFold(stringField(v, "blockType"), "table") {
+		if table == nil {
+			table = v
+		}
+		if content := markdownTable(extractDingTalkTableRows(table)); content != "" {
+			return content
+		}
+	}
+	return extractDingTalkTextFields(v)
+}
+
+func extractDingTalkTextFields(v interface{}) string {
 	var parts []string
 	var walk func(interface{}, string)
 	walk = func(cur interface{}, key string) {
@@ -550,6 +603,164 @@ func extractDingTalkBlockText(v interface{}) string {
 	}
 	walk(v, "")
 	return strings.Join(parts, "\n")
+}
+
+func extractDingTalkTableRows(table map[string]interface{}) [][]string {
+	for _, key := range []string{"rows", "tableRows", "table_rows", "cells"} {
+		if rows := tableRowsFromInterface(table[key]); len(rows) > 0 {
+			return rows
+		}
+	}
+
+	// Some responses wrap rows in a nested data/result object.
+	for _, child := range table {
+		if nested, ok := child.(map[string]interface{}); ok {
+			if rows := extractDingTalkTableRows(nested); len(rows) > 0 {
+				return rows
+			}
+		}
+	}
+	return nil
+}
+
+func tableRowsFromInterface(v interface{}) [][]string {
+	rawRows, ok := v.([]interface{})
+	if !ok || len(rawRows) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0, len(rawRows))
+	for _, rawRow := range rawRows {
+		cells := tableCellsFromInterface(rawRow)
+		if len(cells) == 0 {
+			return nil
+		}
+		rows = append(rows, cells)
+	}
+	return rows
+}
+
+func tableCellsFromInterface(v interface{}) []string {
+	switch val := v.(type) {
+	case []interface{}:
+		cells := make([]string, 0, len(val))
+		for _, cell := range val {
+			cells = append(cells, extractDingTalkTableCell(cell))
+		}
+		return cells
+	case map[string]interface{}:
+		for _, key := range []string{"cells", "columns", "children", "items"} {
+			if cells := tableCellsFromInterface(val[key]); len(cells) > 0 {
+				return cells
+			}
+		}
+	}
+	return nil
+}
+
+func extractDingTalkTableCell(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return strings.TrimSpace(val)
+	case []interface{}:
+		parts := make([]string, 0, len(val))
+		for _, child := range val {
+			if text := extractDingTalkTableCell(child); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]interface{}:
+		for _, key := range []string{"value", "cell", "tableCell", "text", "content", "plaintext", "plain_text"} {
+			if _, exists := val[key]; !exists {
+				continue
+			}
+			if text := extractDingTalkTableCell(val[key]); text != "" {
+				return text
+			}
+		}
+		if imageURL := extractDingTalkImageURL(val); imageURL != "" {
+			return fmt.Sprintf("![](%s)", imageURL)
+		}
+	}
+	return ""
+}
+
+func extractDingTalkImageURL(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		value := strings.TrimSpace(val)
+		if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+			return value
+		}
+	case []interface{}:
+		for _, child := range val {
+			if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+				return imageURL
+			}
+		}
+	case map[string]interface{}:
+		for candidate, child := range val {
+			key := strings.ToLower(candidate)
+			switch key {
+			case "url", "src", "imageurl", "image_url", "downloadurl", "download_url", "resourceurl", "resource_url", "contenturl", "content_url":
+				if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+					return imageURL
+				}
+			}
+		}
+		for candidate, child := range val {
+			key := strings.ToLower(candidate)
+			if key == "image" || key == "picture" || key == "inlineimage" || key == "inline_image" || key == "media" {
+				if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+					return imageURL
+				}
+			}
+		}
+		if strings.EqualFold(stringField(val, "type"), "image") || strings.EqualFold(stringField(val, "blockType"), "image") {
+			for _, child := range val {
+				if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+					return imageURL
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func interfaceMapSlice(v interface{}) []map[string]interface{} {
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		if m, ok := item.(map[string]interface{}); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func mapField(m map[string]interface{}, key string) map[string]interface{} {
+	for candidate, value := range m {
+		if strings.EqualFold(candidate, key) {
+			if result, ok := value.(map[string]interface{}); ok {
+				return result
+			}
+		}
+	}
+	return nil
+}
+
+func stringField(m map[string]interface{}, key string) string {
+	for candidate, value := range m {
+		if strings.EqualFold(candidate, key) {
+			if result, ok := value.(string); ok {
+				return result
+			}
+		}
+	}
+	return ""
 }
 
 func (s workbookSheetItem) identifier() string {

@@ -164,6 +164,95 @@ func TestConnector_Type(t *testing.T) {
 	}
 }
 
+func TestExtractDingTalkBlockText_convertsMarkdownTableCells(t *testing.T) {
+	document := map[string]interface{}{
+		"blocks": []interface{}{
+			map[string]interface{}{
+				"type": "paragraph",
+				"paragraph": map[string]interface{}{
+					"elements": []interface{}{
+						map[string]interface{}{"textRun": map[string]interface{}{"text": "说明"}},
+					},
+				},
+			},
+			map[string]interface{}{
+				"type": "table",
+				"table": map[string]interface{}{
+					"rowSize": 2,
+					"colSize": 2,
+					"rows": []interface{}{
+						[]interface{}{
+							map[string]interface{}{"value": "名称"},
+							map[string]interface{}{"value": "数量"},
+						},
+						[]interface{}{
+							map[string]interface{}{"value": "苹果"},
+							map[string]interface{}{"value": "3"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := extractDingTalkBlockText(document)
+	want := "说明\n\n| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"
+	if got != want {
+		t.Fatalf("extractDingTalkBlockText() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractDingTalkBlockText_readsDingTalkResultDataTableCells(t *testing.T) {
+	document := map[string]interface{}{
+		"result": map[string]interface{}{
+			"data": []interface{}{
+				map[string]interface{}{
+					"blockType": "table",
+					"table": map[string]interface{}{
+						"cells": []interface{}{
+							[]interface{}{"名称", "数量"},
+							[]interface{}{"苹果", "3"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := extractDingTalkBlockText(document)
+	want := "| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"
+	if got != want {
+		t.Fatalf("extractDingTalkBlockText() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractDingTalkBlockText_convertsImageTableCellsToMarkdownLinks(t *testing.T) {
+	document := map[string]interface{}{
+		"result": map[string]interface{}{
+			"data": []interface{}{
+				map[string]interface{}{
+					"blockType": "table",
+					"table": map[string]interface{}{
+						"cells": []interface{}{
+							[]interface{}{"名称", "图片"},
+							[]interface{}{"商品", map[string]interface{}{
+								"type":  "image",
+								"image": map[string]interface{}{"url": "https://example.com/item.png"},
+							}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := extractDingTalkBlockText(document)
+	want := "| 名称 | 图片 |\n| --- | --- |\n| 商品 | ![](https://example.com/item.png) |"
+	if got != want {
+		t.Fatalf("extractDingTalkBlockText() = %q, want %q", got, want)
+	}
+}
+
 func TestParseDingTalkConfig_acceptsAppIDAlias(t *testing.T) {
 	cfg, _, err := parseDingTalkConfig(&types.DataSourceConfig{
 		Credentials: map[string]interface{}{
@@ -206,6 +295,7 @@ func TestFetchIncremental_skipsUnchanged(t *testing.T) {
 	ctx := context.Background()
 	prev := &types.SyncCursor{
 		ConnectorCursor: map[string]interface{}{
+			"parser_version": "3",
 			"doc_revisions": map[string]string{
 				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
 			},
@@ -221,6 +311,45 @@ func TestFetchIncremental_skipsUnchanged(t *testing.T) {
 	}
 	if next == nil || next.ConnectorCursor == nil {
 		t.Fatal("expected next cursor")
+	}
+}
+
+func TestFetchIncremental_reprocessesWhenParserVersionChanges(t *testing.T) {
+	dentries := []dentryItem{{
+		ID:          "doc1",
+		Name:        "Spec",
+		Type:        "FILE",
+		Extension:   "md",
+		UpdatedTime: "2026-01-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkServer(dentries)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
+	}
+	prev := &types.SyncCursor{
+		ConnectorCursor: map[string]interface{}{
+			"parser_version": "old",
+			"doc_revisions": map[string]string{
+				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
+			},
+		},
+	}
+
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, prev)
+	if err != nil {
+		t.Fatalf("FetchIncremental: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item after parser version change, got %d", len(items))
 	}
 }
 

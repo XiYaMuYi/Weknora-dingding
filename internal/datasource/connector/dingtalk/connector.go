@@ -15,6 +15,8 @@ import (
 
 var _ datasource.Connector = (*Connector)(nil)
 
+const dingtalkContentParserVersion = "3"
+
 // Connector implements datasource.Connector for DingTalk online documents.
 type Connector struct{}
 
@@ -303,10 +305,12 @@ func (c *Connector) sync(
 	client := NewClient(cfg)
 
 	newCursor := dingtalkCursor{
-		LastSyncTime: time.Now().UTC(),
-		DocRevisions: make(map[string]string),
+		LastSyncTime:  time.Now().UTC(),
+		ParserVersion: dingtalkContentParserVersion,
+		DocRevisions:  make(map[string]string),
 	}
-	if prev != nil && prev.DocRevisions != nil {
+	parserChanged := incremental && prev != nil && prev.ParserVersion != dingtalkContentParserVersion
+	if !parserChanged && prev != nil && prev.DocRevisions != nil {
 		for k, v := range prev.DocRevisions {
 			newCursor.DocRevisions[k] = v
 		}
@@ -342,7 +346,7 @@ func (c *Connector) sync(
 	for _, ref := range seenDocs {
 		rev := ref.revision
 
-		if incremental && prev != nil && prev.DocRevisions != nil {
+		if incremental && !parserChanged && prev != nil && prev.DocRevisions != nil {
 			if old, ok := prev.DocRevisions[ref.externalID]; ok && old == rev {
 				continue
 			}
@@ -420,6 +424,7 @@ func (c *Connector) sync(
 		LastSyncTime: newCursor.LastSyncTime,
 		ConnectorCursor: map[string]interface{}{
 			"last_sync_time": newCursor.LastSyncTime,
+			"parser_version": newCursor.ParserVersion,
 			"doc_revisions":  newCursor.DocRevisions,
 		},
 	}

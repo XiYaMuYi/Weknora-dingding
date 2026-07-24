@@ -212,6 +212,7 @@ type listWorkbookSheetsResponse struct {
 
 // dingtalkCursor stores incremental sync state.
 type dingtalkCursor struct {
-	LastSyncTime time.Time         `json:"last_sync_time"`
-	DocRevisions map[string]string `json:"doc_revisions"` // external_id -> revision key
+	LastSyncTime  time.Time         `json:"last_sync_time"`
+	ParserVersion string            `json:"parser_version"`
+	DocRevisions  map[string]string `json:"doc_revisions"` // external_id -> revision key
 }
