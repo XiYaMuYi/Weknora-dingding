@@ -218,6 +218,59 @@ func TestDownloadWikiDocContent_downloadFailureDoesNotFallbackToBlocks(t *testin
 	}
 }
 
+func TestDownloadWikiDocViaBlocks_remainsAvailable(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("operatorId") != "operator" {
+			t.Fatalf("operatorId = %q", r.URL.Query().Get("operatorId"))
+		}
+		writeJSON(w, map[string]interface{}{
+			"blocks": []interface{}{
+				map[string]interface{}{
+					"type": "paragraph",
+					"paragraph": map[string]interface{}{
+						"elements": []interface{}{
+							map[string]interface{}{"textRun": map[string]interface{}{"text": "说明"}},
+						},
+					},
+				},
+				map[string]interface{}{
+					"type": "table",
+					"table": map[string]interface{}{
+						"rows": []interface{}{
+							[]interface{}{"名称", "数量"},
+							[]interface{}{"苹果", "3"},
+						},
+					},
+				},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	data, fileName, err := client.downloadWikiDocViaBlocks(context.Background(), "doc-key", "测试文档.adoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileName != "测试文档.md" {
+		t.Fatalf("fileName = %q, want 测试文档.md", fileName)
+	}
+	want := "说明\n\n| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"
+	if string(data) != want {
+		t.Fatalf("content = %q, want %q", data, want)
+	}
+}
+
 func fakeDingTalkServer(dentries []dentryItem) (*httptest.Server, *Config) {
 	mux := http.NewServeMux()
 
