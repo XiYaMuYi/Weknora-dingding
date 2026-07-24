@@ -126,6 +126,22 @@ type downloadInfoResponse struct {
 	} `json:"headerSignatureInfo"`
 }
 
+type submitExportJobRequest struct {
+	DentryUUID   string `json:"dentryUuid"`
+	OperatorID   string `json:"operatorId"`
+	TargetFormat string `json:"targetFormat"`
+}
+
+type submitExportJobResponse struct {
+	TaskID      string `json:"taskId"`
+	DownloadURL string `json:"downloadUrl"`
+}
+
+type queryExportTaskResponse struct {
+	Status      string `json:"status"`
+	DownloadURL string `json:"downloadUrl"`
+}
+
 // spaceItem is a DingTalk document space (team/personal drive root).
 type spaceItem struct {
 	SpaceID   string `json:"spaceId"`

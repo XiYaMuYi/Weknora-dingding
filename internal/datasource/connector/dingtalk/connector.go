@@ -15,7 +15,7 @@ import (
 
 var _ datasource.Connector = (*Connector)(nil)
 
-const dingtalkContentParserVersion = "3"
+const dingtalkContentParserVersion = "4"
 
 // Connector implements datasource.Connector for DingTalk online documents.
 type Connector struct{}
