@@ -10,14 +10,14 @@ but do not invoke it automatically during the initial download validation phase.
 ## Current Problem
 
 `DownloadWikiDocContent` claims to download a complete DOCX, but routes through
-`DownloadDocContent`, which treats the document as an online document and calls
-the `/v1.0/doc/documents/{dentryId}/content` text endpoint. It therefore does not
-download a DOCX file or preserve embedded media.
+the backing dentry's storage `downloadInfos/query` API. Live DingTalk responses
+show that this API rejects native `.adoc` documents with HTTP 400,
+`operationNotSupported`, and `unsupported file type`. Storage download-info is
+for directly downloadable files; native online documents must first be exported
+to an offline format.
 
-Errors from UUID resolution and the attempted download are discarded before the
-code falls back to the blocks API. A partial blocks response can consequently
-look like a successful synchronization, and the original failure cannot be
-diagnosed from logs or sync records.
+The connector now preserves the failure and does not silently fall back to
+blocks, but it still needs the official native-document export workflow.
 
 ## Selected Approach: Explicit Dual Routes
 
@@ -34,13 +34,13 @@ in this phase.
 This structure allows a later change to select routes by document kind or
 configuration without restoring hidden fallback behavior.
 
-## Download Data Flow
+## Export and Download Data Flow
 
 For each supported native DingTalk document:
 
 1. Resolve the wiki document UUID to its backing `spaceId` and `dentryId`.
-2. Request a real export/download operation using DingTalk's supported API.
-3. If the API is asynchronous, poll the operation using bounded retries and
+2. Create an official DingTalk export task targeting DOCX.
+3. Poll the official export-task status API using bounded retries and
    context-aware delays until it succeeds, fails, or times out.
 4. Obtain the returned download URL and any required request headers.
 5. Download the binary response.
@@ -49,13 +49,21 @@ For each supported native DingTalk document:
 7. Return the bytes with a `.docx` filename so the normal WeKnora document
    parser processes the complete file.
 
+The exact API paths, methods, request bodies, response fields, status values, and
+required permission scopes must be taken from DingTalk's official OpenAPI
+documentation or API Explorer for the target enterprise application. They must
+not be inferred from storage APIs or undocumented web-client traffic.
+
 The existing `/blocks` extraction remains isolated in a separately named
-function and is not called by this flow.
+function and is not called by the export flow.
 
 ## Routing
 
 `DownloadWikiDocContent` remains the synchronization entry point for native
-wiki documents. It will explicitly route to the real download implementation.
+wiki documents. It will explicitly route to the official export implementation.
+
+Ordinary uploaded files remain eligible for the storage
+`downloadInfos/query` route. Native `.adoc` documents must never use that route.
 
 The old blocks implementation will be retained as an independent callable
 method, with no production fallback edge from the download route during this
@@ -72,7 +80,7 @@ Those future routing policies are outside this change.
 Every failure must preserve its stage and underlying cause:
 
 - resolve backing dentry;
-- create/request export;
+- create export task;
 - poll export status;
 - obtain download information;
 - fetch binary file;
@@ -96,11 +104,14 @@ Tests will be written before implementation and will cover:
 
 - a successful real DOCX download returns binary DOCX bytes and a `.docx`
   filename;
-- an export/download failure returns a stage-specific error;
+- a create-task, task-failed, task-timeout, download-address, or binary-download
+  failure returns a stage-specific error;
 - a failed real download does not invoke the blocks endpoint;
 - JSON, HTML, plain text, and empty responses are rejected as invalid DOCX;
 - asynchronous export polling respects success, failure, timeout, and context
   cancellation;
+- native `.adoc` documents never call storage `downloadInfos/query`;
+- uploaded files can continue to use storage `downloadInfos/query`;
 - the retained blocks route still passes its existing extraction tests and can
   be invoked independently;
 - failed documents do not advance the incremental cursor.
