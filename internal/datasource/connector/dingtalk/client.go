@@ -18,8 +18,10 @@ import (
 
 // Client calls DingTalk Open APIs for document storage.
 type Client struct {
-	cfg        *Config
-	httpClient *http.Client
+	cfg                *Config
+	httpClient         *http.Client
+	exportPollInterval time.Duration
+	exportMaxPolls     int
 
 	tokenMu    sync.Mutex
 	tokenCache string
@@ -28,8 +30,10 @@ type Client struct {
 
 func NewClient(cfg *Config) *Client {
 	return &Client{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 45 * time.Second},
+		cfg:                cfg,
+		httpClient:         &http.Client{Timeout: 45 * time.Second},
+		exportPollInterval: 2 * time.Second,
+		exportMaxPolls:     150,
 	}
 }
 
@@ -433,7 +437,118 @@ func (c *Client) downloadViaExportFallback(ctx context.Context, token, spaceID, 
 }
 
 func (c *Client) DownloadWikiDocContent(ctx context.Context, docKey, name, extension string) ([]byte, string, error) {
-	return c.downloadWikiDocBinary(ctx, docKey, name)
+	return c.exportWikiDocAsDOCX(ctx, docKey, name)
+}
+
+func (c *Client) submitDocumentExport(ctx context.Context, dentryUUID string) (*submitExportJobResponse, error) {
+	var out submitExportJobResponse
+	err := c.doAPI(ctx, http.MethodPost, "/v2.0/doc/me/export/submit", nil, submitExportJobRequest{
+		DentryUUID:   dentryUUID,
+		OperatorID:   c.cfg.OperatorUnionID,
+		TargetFormat: "docx",
+	}, &out)
+	if err != nil {
+		return nil, err
+	}
+	if out.DownloadURL == "" && out.TaskID == "" {
+		return nil, fmt.Errorf("钉钉未返回导出任务 ID 或下载地址")
+	}
+	return &out, nil
+}
+
+func (c *Client) queryDocumentExport(ctx context.Context, taskID string) (*queryExportTaskResponse, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	q.Set("taskId", taskID)
+	var out queryExportTaskResponse
+	if err := c.doAPI(ctx, http.MethodGet, "/v2.0/doc/me/export/task/query", q, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) pollDocumentExport(ctx context.Context, taskID string) (string, error) {
+	for attempt := 0; attempt < c.exportMaxPolls; attempt++ {
+		if c.exportPollInterval > 0 {
+			timer := time.NewTimer(c.exportPollInterval)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return "", fmt.Errorf("钉钉文档导出轮询被取消：taskId=%s: %w", taskID, ctx.Err())
+			case <-timer.C:
+			}
+		}
+		result, err := c.queryDocumentExport(ctx, taskID)
+		if err != nil {
+			return "", fmt.Errorf("查询钉钉文档导出任务失败：taskId=%s: %w", taskID, err)
+		}
+		status := strings.ToUpper(strings.TrimSpace(result.Status))
+		switch status {
+		case "SUCCESS":
+			if result.DownloadURL == "" {
+				return "", fmt.Errorf("钉钉文档导出成功但 downloadUrl 为空：taskId=%s", taskID)
+			}
+			return result.DownloadURL, nil
+		case "PROCESSING":
+			continue
+		default:
+			return "", fmt.Errorf("钉钉文档导出任务失败：taskId=%s status=%s", taskID, result.Status)
+		}
+	}
+	return "", fmt.Errorf("钉钉文档导出任务超时：taskId=%s，已轮询 %d 次", taskID, c.exportMaxPolls)
+}
+
+func (c *Client) exportWikiDocAsDOCX(ctx context.Context, dentryUUID, name string) ([]byte, string, error) {
+	result, err := c.submitDocumentExport(ctx, dentryUUID)
+	if err != nil {
+		wrapped := fmt.Errorf("提交钉钉文档导出任务失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q stage=submit_export error=%v", name, dentryUUID, wrapped)
+		return nil, "", wrapped
+	}
+	if result.DownloadURL == "" {
+		result.DownloadURL, err = c.pollDocumentExport(ctx, result.TaskID)
+		if err != nil {
+			logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q taskId=%q stage=poll_export error=%v", name, dentryUUID, result.TaskID, err)
+			return nil, "", err
+		}
+	}
+	data, err := c.downloadExportFile(ctx, result.DownloadURL)
+	if err != nil {
+		wrapped := fmt.Errorf("下载钉钉文档导出结果失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q taskId=%q stage=download_export error=%v", name, dentryUUID, result.TaskID, wrapped)
+		return nil, "", wrapped
+	}
+	if err := validateDOCX(data); err != nil {
+		wrapped := fmt.Errorf("校验钉钉文档导出结果失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q taskId=%q stage=validate_docx error=%v", name, dentryUUID, result.TaskID, wrapped)
+		return nil, "", wrapped
+	}
+	return data, documentFileName(name, "docx"), nil
+}
+
+func (c *Client) downloadExportFile(ctx context.Context, rawURL string) ([]byte, error) {
+	if !c.isAllowedDownloadHost(rawURL) {
+		return nil, fmt.Errorf("download url host not allowed")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("下载钉钉导出文件失败：HTTP %d %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	return data, nil
 }
 
 func (c *Client) downloadWikiDocBinary(ctx context.Context, docKey, name string) ([]byte, string, error) {

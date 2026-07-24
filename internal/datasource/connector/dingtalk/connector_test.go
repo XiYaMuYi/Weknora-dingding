@@ -86,7 +86,7 @@ func TestValidateDOCX_acceptsDOCX(t *testing.T) {
 	}
 }
 
-func TestDownloadWikiDocContent_downloadsBackingDentryAsDOCX(t *testing.T) {
+func TestDownloadWikiDocContent_exportImmediateSuccess(t *testing.T) {
 	wantDOCX := testDOCXBytes(t)
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
@@ -95,21 +95,31 @@ func TestDownloadWikiDocContent_downloadsBackingDentryAsDOCX(t *testing.T) {
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
-	mux.HandleFunc("/v2.0/doc/dentries/doc-key/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, dentryIDByUUIDResponse{SpaceID: "space-1", DentryID: "dentry-1"})
-	})
-	mux.HandleFunc("/v1.0/storage/spaces/space-1/dentries/dentry-1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			t.Fatalf("download info method = %s, want POST", r.Method)
+			t.Fatalf("submit method = %s, want POST", r.Method)
 		}
-		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/document.docx"})
+		var body submitExportJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.DentryUUID != "doc-key" || body.OperatorID != "operator" || body.TargetFormat != "docx" {
+			t.Fatalf("submit body = %+v", body)
+		}
+		writeJSON(w, submitExportJobResponse{TaskID: "task-1", DownloadURL: srv.URL + "/download/document.docx"})
 	})
 	mux.HandleFunc("/download/document.docx", func(w http.ResponseWriter, r *http.Request) {
+		if token := r.Header.Get("x-acs-dingtalk-access-token"); token != "" {
+			t.Fatalf("export download leaked access token %q", token)
+		}
 		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 		_, _ = w.Write(wantDOCX)
 	})
-	mux.HandleFunc("/v1.0/doc/documents/dentry-1/content", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("legacy content endpoint must not be called")
+	mux.HandleFunc("/v2.0/doc/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("resolve dentry endpoint must not be called")
+	})
+	mux.HandleFunc("/v1.0/storage/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("storage download endpoint must not be called")
 	})
 	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("blocks endpoint must not be called")
@@ -133,18 +143,110 @@ func TestDownloadWikiDocContent_downloadsBackingDentryAsDOCX(t *testing.T) {
 	}
 }
 
-func TestDownloadWikiDocContent_resolveFailureDoesNotFallbackToBlocks(t *testing.T) {
+func TestDownloadWikiDocContent_pollsExportUntilSuccess(t *testing.T) {
+	wantDOCX := testDOCXBytes(t)
+	queryCalls := 0
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, submitExportJobResponse{TaskID: "task-1"})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+		queryCalls++
+		if r.URL.Query().Get("operatorId") != "operator" || r.URL.Query().Get("taskId") != "task-1" {
+			t.Fatalf("query = %q", r.URL.RawQuery)
+		}
+		if queryCalls == 1 {
+			writeJSON(w, queryExportTaskResponse{Status: "processing"})
+			return
+		}
+		writeJSON(w, queryExportTaskResponse{Status: "success", DownloadURL: srv.URL + "/export.docx"})
+	})
+	mux.HandleFunc("/export.docx", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(wantDOCX)
+	})
+
+	client := NewClient(&Config{AppKey: "key", AppSecret: "secret", OperatorUnionID: "operator", BaseURL: srv.URL})
+	client.exportPollInterval = time.Nanosecond
+	client.exportMaxPolls = 3
+	data, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, wantDOCX) || queryCalls != 2 {
+		t.Fatalf("queryCalls=%d dataEqual=%v", queryCalls, bytes.Equal(data, wantDOCX))
+	}
+}
+
+func TestPollDocumentExport_terminalFailures(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      string
+		downloadURL string
+		want        string
+	}{
+		{name: "failed", status: "FAILED", want: "FAILED"},
+		{name: "success missing URL", status: "SUCCESS", want: "downloadUrl"},
+		{name: "unknown", status: "UNKNOWN", want: "UNKNOWN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+			})
+			mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, queryExportTaskResponse{Status: tt.status, DownloadURL: tt.downloadURL})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			client := NewClient(&Config{AppKey: "key", AppSecret: "secret", OperatorUnionID: "operator", BaseURL: srv.URL})
+			client.exportPollInterval = time.Nanosecond
+			client.exportMaxPolls = 1
+			_, err := client.pollDocumentExport(context.Background(), "task-1")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPollDocumentExport_timesOut(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, queryExportTaskResponse{Status: "PROCESSING"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	client := NewClient(&Config{AppKey: "key", AppSecret: "secret", OperatorUnionID: "operator", BaseURL: srv.URL})
+	client.exportPollInterval = time.Nanosecond
+	client.exportMaxPolls = 2
+	_, err := client.pollDocumentExport(context.Background(), "task-1")
+	if err == nil || !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("error = %v, want timeout", err)
+	}
+}
+
+func TestDownloadWikiDocContent_submitFailureDoesNotFallbackToBlocks(t *testing.T) {
 	blocksCalls := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
-	mux.HandleFunc("/v2.0/doc/dentries/doc-key/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		writeJSON(w, map[string]string{
-			"code":      "Forbidden.ResolveDenied",
-			"message":   "resolve denied",
-			"requestid": "resolve-request-1",
+			"code":      "Forbidden.ExportDenied",
+			"message":   "export denied",
+			"requestid": "export-request-1",
 		})
 	})
 	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
@@ -167,28 +269,28 @@ func TestDownloadWikiDocContent_resolveFailureDoesNotFallbackToBlocks(t *testing
 	if blocksCalls != 0 {
 		t.Fatalf("blocks calls = %d, want 0", blocksCalls)
 	}
-	for _, want := range []string{"解析钉钉文档下载标识失败", "Forbidden.ResolveDenied", "resolve-request-1"} {
+	for _, want := range []string{"提交钉钉文档导出任务失败", "Forbidden.ExportDenied", "export-request-1"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err, want)
 		}
 	}
 }
 
-func TestDownloadWikiDocContent_downloadFailureDoesNotFallbackToBlocks(t *testing.T) {
+func TestDownloadWikiDocContent_pollFailureDoesNotFallbackToBlocks(t *testing.T) {
 	blocksCalls := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
-	mux.HandleFunc("/v2.0/doc/dentries/doc-key/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, dentryIDByUUIDResponse{SpaceID: "space-1", DentryID: "dentry-1"})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, submitExportJobResponse{TaskID: "task-1"})
 	})
-	mux.HandleFunc("/v1.0/storage/spaces/space-1/dentries/dentry-1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		writeJSON(w, map[string]string{
-			"code":      "Forbidden.DownloadDenied",
-			"message":   "download denied",
-			"requestId": "download-request-1",
+			"code":      "Forbidden.QueryDenied",
+			"message":   "query denied",
+			"requestId": "query-request-1",
 		})
 	})
 	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +306,8 @@ func TestDownloadWikiDocContent_downloadFailureDoesNotFallbackToBlocks(t *testin
 		OperatorUnionID: "operator",
 		BaseURL:         srv.URL,
 	})
+	client.exportPollInterval = time.Nanosecond
+	client.exportMaxPolls = 1
 	_, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
 	if err == nil {
 		t.Fatal("DownloadWikiDocContent() error = nil")
@@ -211,7 +315,7 @@ func TestDownloadWikiDocContent_downloadFailureDoesNotFallbackToBlocks(t *testin
 	if blocksCalls != 0 {
 		t.Fatalf("blocks calls = %d, want 0", blocksCalls)
 	}
-	for _, want := range []string{"下载钉钉完整文档失败", "Forbidden.DownloadDenied", "download-request-1"} {
+	for _, want := range []string{"查询钉钉文档导出任务失败", "Forbidden.QueryDenied", "query-request-1"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err, want)
 		}
@@ -379,6 +483,21 @@ func fakeDingTalkWikiServer(t *testing.T, nodes []wikiNodeItem) (*httptest.Serve
 			DentryUUID: docKey,
 			DentryID:   "backing-" + docKey,
 			SpaceID:    "wiki-space",
+		})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		var body submitExportJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.DentryUUID == "missing" {
+			w.WriteHeader(http.StatusBadGateway)
+			writeJSON(w, map[string]string{"code": "ExportFailed", "message": "export unavailable"})
+			return
+		}
+		writeJSON(w, submitExportJobResponse{
+			TaskID:      "task-" + time.Now().Format("150405.000000"),
+			DownloadURL: srv.URL + "/download/wiki.docx",
 		})
 	})
 	mux.HandleFunc("/v1.0/storage/spaces/wiki-space/dentries/", func(w http.ResponseWriter, r *http.Request) {
@@ -573,7 +692,7 @@ func TestFetchIncremental_skipsUnchanged(t *testing.T) {
 	ctx := context.Background()
 	prev := &types.SyncCursor{
 		ConnectorCursor: map[string]interface{}{
-			"parser_version": "3",
+			"parser_version": "4",
 			"doc_revisions": map[string]string{
 				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
 			},
@@ -615,7 +734,7 @@ func TestFetchIncremental_reprocessesWhenParserVersionChanges(t *testing.T) {
 	}
 	prev := &types.SyncCursor{
 		ConnectorCursor: map[string]interface{}{
-			"parser_version": "old",
+			"parser_version": "3",
 			"doc_revisions": map[string]string{
 				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
 			},
