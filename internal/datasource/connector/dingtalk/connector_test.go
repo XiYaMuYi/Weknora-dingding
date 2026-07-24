@@ -1229,6 +1229,81 @@ func TestFetchIncremental_downloadFailureDoesNotAdvanceRevision(t *testing.T) {
 	}
 }
 
+func TestFetchIncremental_emptyWikiSpreadsheetIsSkippedAndAdvancesRevision(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{
+			Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", RootNodeID: "root1"}},
+		})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{
+			NodeID:      "sheet1",
+			WorkspaceID: "wk1",
+			Name:        "空表格.axls",
+			Type:        "FILE",
+			Category:    "SPREADSHEET",
+			UpdatedTime: "2026-07-24T04:38:00Z",
+		}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/sheet1", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{
+			NodeID:      "sheet1",
+			WorkspaceID: "wk1",
+			Name:        "空表格.axls",
+			Type:        "FILE",
+			Category:    "SPREADSHEET",
+			UpdatedTime: "2026-07-24T04:38:00Z",
+		}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWorkbookSheetsResponse{Value: []workbookSheetItem{{
+			ID: "tab1", Name: "Sheet1", RowCount: 10, ColumnCount: 5,
+		}}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets/tab1/ranges/A1:E10", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"values": [][]string{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key": "key", "app_secret": "secret", "base_url": srv.URL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id": "operator", "dingtalk_type": "wiki",
+		},
+	}
+	items, next, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	if items[0].Metadata["error"] != "" {
+		t.Fatalf("empty spreadsheet reported error: %+v", items[0].Metadata)
+	}
+	if reason := items[0].Metadata["skip_reason"]; !strings.Contains(reason, "暂无单元格内容") {
+		t.Fatalf("skip reason = %q", reason)
+	}
+	var cursor dingtalkCursor
+	raw, _ := json.Marshal(next.ConnectorCursor)
+	if err := json.Unmarshal(raw, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	externalID := makeStableWikiDocExternalID("wk1", "sheet1")
+	if cursor.DocRevisions[externalID] == "" {
+		t.Fatalf("empty spreadsheet did not advance revision: %+v", cursor.DocRevisions)
+	}
+}
+
 func TestFetchIncremental_wikiUploadedSpreadsheetIsSkipped(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {

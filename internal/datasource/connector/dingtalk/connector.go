@@ -375,6 +375,11 @@ func (c *Connector) sync(
 		} else {
 			content, fileName, err = client.DownloadDocContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
 		}
+		if errors.Is(err, errEmptyWikiSpreadsheet) {
+			newCursor.DocRevisions[ref.externalID] = rev
+			items = append(items, skippedEmptySpreadsheetItem(ref))
+			continue
+		}
 		if err != nil {
 			items = append(items, types.FetchedItem{
 				ExternalID:       ref.externalID,
@@ -793,6 +798,23 @@ func skippedUnsupportedOnlineItem(ref docRef) types.FetchedItem {
 			"dingtalk_doc_type": ref.metadataDocType(),
 			"dingtalk_doc_kind": string(ref.kind),
 			"skip_reason":       dingtalkUnsupportedOnlineSkipReason(ref.name, ref.extension),
+		},
+	}
+}
+
+func skippedEmptySpreadsheetItem(ref docRef) types.FetchedItem {
+	return types.FetchedItem{
+		ExternalID:       ref.externalID,
+		Title:            ref.name,
+		UpdatedAt:        ref.updatedAt,
+		SourceResourceID: ref.sourceResourceID,
+		Metadata: map[string]string{
+			"channel":           types.ChannelDingtalk,
+			"space_id":          ref.spaceID,
+			"dentry_id":         ref.dentryID,
+			"dingtalk_doc_type": ref.metadataDocType(),
+			"dingtalk_doc_kind": string(ref.kind),
+			"skip_reason":       "钉钉在线表格暂无单元格内容；已记录当前版本，表格更新后会在后续增量同步中重新读取。",
 		},
 	}
 }

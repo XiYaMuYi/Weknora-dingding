@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/logger"
 )
+
+var errEmptyWikiSpreadsheet = errors.New("钉钉在线表格暂无单元格内容")
 
 // Client calls DingTalk Open APIs for document storage.
 type Client struct {
@@ -665,7 +668,7 @@ func (c *Client) DownloadWikiSpreadsheetContent(ctx context.Context, workbookID,
 	}
 
 	if !hasContent {
-		return nil, "", fmt.Errorf("读取知识库表格失败：表格没有可同步的单元格内容")
+		return nil, "", errEmptyWikiSpreadsheet
 	}
 	return []byte(strings.TrimSpace(b.String()) + "\n"), markdownFileName(name), nil
 }
