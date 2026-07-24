@@ -1,8 +1,11 @@
 package dingtalk
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -16,6 +19,75 @@ import (
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func testDOCXBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range map[string]string{
+		"[Content_Types].xml": `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`,
+		"word/document.xml":   `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>`,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(w, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestDownloadWikiDocContent_downloadsBackingDentryAsDOCX(t *testing.T) {
+	wantDOCX := testDOCXBytes(t)
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/dentries/doc-key/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, dentryIDByUUIDResponse{SpaceID: "space-1", DentryID: "dentry-1"})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/space-1/dentries/dentry-1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("download info method = %s, want POST", r.Method)
+		}
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/document.docx"})
+	})
+	mux.HandleFunc("/download/document.docx", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+		_, _ = w.Write(wantDOCX)
+	})
+	mux.HandleFunc("/v1.0/doc/documents/dentry-1/content", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("legacy content endpoint must not be called")
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("blocks endpoint must not be called")
+	})
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	data, fileName, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileName != "测试文档.docx" {
+		t.Fatalf("fileName = %q, want %q", fileName, "测试文档.docx")
+	}
+	if !bytes.Equal(data, wantDOCX) {
+		t.Fatal("returned bytes differ from downloaded DOCX")
+	}
 }
 
 func fakeDingTalkServer(dentries []dentryItem) (*httptest.Server, *Config) {

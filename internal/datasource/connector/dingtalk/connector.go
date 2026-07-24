@@ -1011,14 +1011,18 @@ func pickFileName(name, extension, defaultExt string) string {
 }
 
 func markdownFileName(name string) string {
+	return documentFileName(name, "md")
+}
+
+func documentFileName(name, extension string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return "document.md"
+		return "document." + extension
 	}
 	if idx := strings.LastIndex(name, "."); idx > 0 {
 		name = name[:idx]
 	}
-	return pickFileName(name, "md", "md")
+	return pickFileName(name, extension, extension)
 }
 
 func isDingTalkNativeOnlineDocExtension(extension string) bool {

@@ -432,15 +432,28 @@ func (c *Client) downloadViaExportFallback(ctx context.Context, token, spaceID, 
 }
 
 func (c *Client) DownloadWikiDocContent(ctx context.Context, docKey, name, extension string) ([]byte, string, error) {
-	// Native wiki documents may contain embedded media that the blocks API
-	// represents only as newline placeholders. Resolve the backing dentry and
-	// download the complete file first so the document parser can preserve the
-	// media and its positions.
-	if info, err := c.ResolveDentryIDByUUID(ctx, docKey); err == nil {
-		if data, fileName, downloadErr := c.DownloadDocContent(ctx, info.SpaceID, info.DentryID, name, "docx"); downloadErr == nil {
-			return data, fileName, nil
-		}
+	return c.downloadWikiDocBinary(ctx, docKey, name)
+}
+
+func (c *Client) downloadWikiDocBinary(ctx context.Context, docKey, name string) ([]byte, string, error) {
+	info, err := c.ResolveDentryIDByUUID(ctx, docKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("解析钉钉文档下载标识失败：%w", err)
 	}
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("获取钉钉文档下载凭证失败：%w", err)
+	}
+	path := fmt.Sprintf("/v1.0/storage/spaces/%s/dentries/%s/downloadInfos/query",
+		url.PathEscape(info.SpaceID), url.PathEscape(info.DentryID))
+	data, err := c.downloadStorageFile(ctx, token, path, name, "docx")
+	if err != nil {
+		return nil, "", fmt.Errorf("下载钉钉完整文档失败：%w", err)
+	}
+	return data, documentFileName(name, "docx"), nil
+}
+
+func (c *Client) downloadWikiDocViaBlocks(ctx context.Context, docKey, name string) ([]byte, string, error) {
 	q := url.Values{}
 	q.Set("operatorId", c.cfg.OperatorUnionID)
 	path := fmt.Sprintf("/v1.0/doc/suites/documents/%s/blocks", url.PathEscape(docKey))
