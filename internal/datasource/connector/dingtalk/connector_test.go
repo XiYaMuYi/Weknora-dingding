@@ -43,6 +43,49 @@ func testDOCXBytes(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
+func zipBytesContainingOnly(t *testing.T, name, content string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestValidateDOCX_rejectsInvalidDownloads(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty", data: nil},
+		{name: "json error", data: []byte(`{"code":"Forbidden","message":"denied"}`)},
+		{name: "html login page", data: []byte("<html><body>login</body></html>")},
+		{name: "plain text", data: []byte("document text")},
+		{name: "zip without word document", data: zipBytesContainingOnly(t, "other.txt", "x")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateDOCX(tt.data); err == nil {
+				t.Fatal("validateDOCX() error = nil, want rejection")
+			}
+		})
+	}
+}
+
+func TestValidateDOCX_acceptsDOCX(t *testing.T) {
+	if err := validateDOCX(testDOCXBytes(t)); err != nil {
+		t.Fatalf("validateDOCX() error = %v", err)
+	}
+}
+
 func TestDownloadWikiDocContent_downloadsBackingDentryAsDOCX(t *testing.T) {
 	wantDOCX := testDOCXBytes(t)
 	mux := http.NewServeMux()

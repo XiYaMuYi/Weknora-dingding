@@ -1,6 +1,7 @@
 package dingtalk
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -450,7 +451,34 @@ func (c *Client) downloadWikiDocBinary(ctx context.Context, docKey, name string)
 	if err != nil {
 		return nil, "", fmt.Errorf("下载钉钉完整文档失败：%w", err)
 	}
+	if err := validateDOCX(data); err != nil {
+		return nil, "", fmt.Errorf("校验钉钉完整文档失败：%w", err)
+	}
 	return data, documentFileName(name, "docx"), nil
+}
+
+func validateDOCX(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("下载内容为空")
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("下载内容不是有效的 DOCX/ZIP：%w", err)
+	}
+	hasContentTypes := false
+	hasDocument := false
+	for _, file := range zr.File {
+		switch file.Name {
+		case "[Content_Types].xml":
+			hasContentTypes = true
+		case "word/document.xml":
+			hasDocument = true
+		}
+	}
+	if !hasContentTypes || !hasDocument {
+		return fmt.Errorf("下载的 ZIP 缺少 DOCX 必需文件")
+	}
+	return nil
 }
 
 func (c *Client) downloadWikiDocViaBlocks(ctx context.Context, docKey, name string) ([]byte, string, error) {
