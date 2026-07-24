@@ -102,8 +102,10 @@ type oauthTokenResponse struct {
 }
 
 type apiErrorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code           string `json:"code"`
+	Message        string `json:"message"`
+	RequestID      string `json:"requestid"`
+	RequestIDCamel string `json:"requestId"`
 }
 
 type dentryIDByUUIDResponse struct {

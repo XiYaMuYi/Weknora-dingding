@@ -1,6 +1,7 @@
 package dingtalk
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -432,15 +433,63 @@ func (c *Client) downloadViaExportFallback(ctx context.Context, token, spaceID, 
 }
 
 func (c *Client) DownloadWikiDocContent(ctx context.Context, docKey, name, extension string) ([]byte, string, error) {
-	// Native wiki documents may contain embedded media that the blocks API
-	// represents only as newline placeholders. Resolve the backing dentry and
-	// download the complete file first so the document parser can preserve the
-	// media and its positions.
-	if info, err := c.ResolveDentryIDByUUID(ctx, docKey); err == nil {
-		if data, fileName, downloadErr := c.DownloadDocContent(ctx, info.SpaceID, info.DentryID, name, "docx"); downloadErr == nil {
-			return data, fileName, nil
+	return c.downloadWikiDocBinary(ctx, docKey, name)
+}
+
+func (c *Client) downloadWikiDocBinary(ctx context.Context, docKey, name string) ([]byte, string, error) {
+	info, err := c.ResolveDentryIDByUUID(ctx, docKey)
+	if err != nil {
+		wrapped := fmt.Errorf("解析钉钉文档下载标识失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=resolve_dentry error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		wrapped := fmt.Errorf("获取钉钉文档下载凭证失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=access_token error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	path := fmt.Sprintf("/v1.0/storage/spaces/%s/dentries/%s/downloadInfos/query",
+		url.PathEscape(info.SpaceID), url.PathEscape(info.DentryID))
+	data, err := c.downloadStorageFile(ctx, token, path, name, "docx")
+	if err != nil {
+		wrapped := fmt.Errorf("下载钉钉完整文档失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=download_file error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	if err := validateDOCX(data); err != nil {
+		wrapped := fmt.Errorf("校验钉钉完整文档失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=validate_docx error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	return data, documentFileName(name, "docx"), nil
+}
+
+func validateDOCX(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("下载内容为空")
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("下载内容不是有效的 DOCX/ZIP：%w", err)
+	}
+	hasContentTypes := false
+	hasDocument := false
+	for _, file := range zr.File {
+		switch file.Name {
+		case "[Content_Types].xml":
+			hasContentTypes = true
+		case "word/document.xml":
+			hasDocument = true
 		}
 	}
+	if !hasContentTypes || !hasDocument {
+		return fmt.Errorf("下载的 ZIP 缺少 DOCX 必需文件")
+	}
+	return nil
+}
+
+func (c *Client) downloadWikiDocViaBlocks(ctx context.Context, docKey, name string) ([]byte, string, error) {
 	q := url.Values{}
 	q.Set("operatorId", c.cfg.OperatorUnionID)
 	path := fmt.Sprintf("/v1.0/doc/suites/documents/%s/blocks", url.PathEscape(docKey))
@@ -1030,16 +1079,25 @@ func humanizeDingTalkAPIError(path, msg string, status int) string {
 func formatDingTalkAPIErrorDetail(apiErr apiErrorBody, raw []byte) string {
 	code := strings.TrimSpace(apiErr.Code)
 	message := strings.TrimSpace(apiErr.Message)
+	requestID := strings.TrimSpace(apiErr.RequestID)
+	if requestID == "" {
+		requestID = strings.TrimSpace(apiErr.RequestIDCamel)
+	}
+	var detail string
 	switch {
 	case code != "" && message != "":
-		return fmt.Sprintf("code=%s message=%s", code, message)
+		detail = fmt.Sprintf("code=%s message=%s", code, message)
 	case code != "":
-		return "code=" + code
+		detail = "code=" + code
 	case message != "":
-		return message
+		detail = message
 	default:
-		return truncate(string(raw), 200)
+		detail = truncate(string(raw), 200)
 	}
+	if requestID != "" {
+		detail += " requestId=" + requestID
+	}
+	return detail
 }
 
 func withDingTalkOriginalDetail(hint, detail string) string {
