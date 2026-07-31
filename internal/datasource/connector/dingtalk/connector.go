@@ -2,6 +2,7 @@ package dingtalk
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -305,14 +306,20 @@ func (c *Connector) sync(
 	client := NewClient(cfg)
 
 	newCursor := dingtalkCursor{
-		LastSyncTime:  time.Now().UTC(),
-		ParserVersion: dingtalkContentParserVersion,
-		DocRevisions:  make(map[string]string),
+		LastSyncTime:      time.Now().UTC(),
+		ParserVersion:     dingtalkContentParserVersion,
+		DocRevisions:      make(map[string]string),
+		SheetFingerprints: make(map[string]string),
 	}
 	parserChanged := incremental && prev != nil && prev.ParserVersion != dingtalkContentParserVersion
 	if !parserChanged && prev != nil && prev.DocRevisions != nil {
 		for k, v := range prev.DocRevisions {
 			newCursor.DocRevisions[k] = v
+		}
+	}
+	if !parserChanged && prev != nil && prev.SheetFingerprints != nil {
+		for k, v := range prev.SheetFingerprints {
+			newCursor.SheetFingerprints[k] = v
 		}
 	}
 
@@ -346,7 +353,8 @@ func (c *Connector) sync(
 	for _, ref := range seenDocs {
 		rev := ref.revision
 
-		if incremental && !parserChanged && prev != nil && prev.DocRevisions != nil {
+		probeSheet := sheetRevisionUnreliable(ref)
+		if incremental && !parserChanged && !probeSheet && prev != nil && prev.DocRevisions != nil {
 			if old, ok := prev.DocRevisions[ref.externalID]; ok && old == rev {
 				continue
 			}
@@ -374,6 +382,24 @@ func (c *Connector) sync(
 			}
 		} else {
 			content, fileName, err = client.DownloadDocContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
+		}
+		if probeSheet {
+			fingerprint := ""
+			if err == nil {
+				fingerprint = sheetContentFingerprint(content)
+			} else if errors.Is(err, errEmptyWikiSpreadsheet) {
+				fingerprint = sheetContentFingerprint(nil)
+			}
+			if err == nil || errors.Is(err, errEmptyWikiSpreadsheet) {
+				old := ""
+				if prev != nil && prev.SheetFingerprints != nil {
+					old = prev.SheetFingerprints[ref.externalID]
+				}
+				newCursor.SheetFingerprints[ref.externalID] = fingerprint
+				if old != "" && old == fingerprint {
+					continue
+				}
+			}
 		}
 		if errors.Is(err, errEmptyWikiSpreadsheet) {
 			newCursor.DocRevisions[ref.externalID] = rev
@@ -418,6 +444,7 @@ func (c *Connector) sync(
 				continue
 			}
 			delete(newCursor.DocRevisions, externalID)
+			delete(newCursor.SheetFingerprints, externalID)
 			items = append(items, types.FetchedItem{
 				ExternalID: externalID,
 				IsDeleted:  true,
@@ -428,9 +455,10 @@ func (c *Connector) sync(
 	next := &types.SyncCursor{
 		LastSyncTime: newCursor.LastSyncTime,
 		ConnectorCursor: map[string]interface{}{
-			"last_sync_time": newCursor.LastSyncTime,
-			"parser_version": newCursor.ParserVersion,
-			"doc_revisions":  newCursor.DocRevisions,
+			"last_sync_time":     newCursor.LastSyncTime,
+			"parser_version":     newCursor.ParserVersion,
+			"doc_revisions":      newCursor.DocRevisions,
+			"sheet_fingerprints": newCursor.SheetFingerprints,
 		},
 	}
 	return items, next, nil
@@ -497,6 +525,7 @@ type docRef struct {
 	url              string
 	docType          string
 	kind             dingtalkDocumentKind
+	revisionReliable bool
 }
 
 func (r docRef) itemURL() string {
@@ -708,6 +737,7 @@ func (c *Connector) collectWikiDocRefs(
 									name:             n.Name,
 									extension:        extensionFromWikiNode(n),
 									revision:         wikiRevisionKey(n),
+									revisionReliable: n.UpdatedTime != "" || n.Size != 0,
 									updatedAt:        parseUpdatedTime(n.UpdatedTime),
 									sourceResourceID: makeWikiNodeResourceID(workspaceID, n.NodeID),
 									url:              n.URL,
@@ -745,6 +775,7 @@ func (c *Connector) collectWikiDocRefs(
 					name:             n.Name,
 					extension:        extensionFromWikiNode(n),
 					revision:         wikiRevisionKey(n),
+					revisionReliable: n.UpdatedTime != "" || n.Size != 0,
 					updatedAt:        parseUpdatedTime(n.UpdatedTime),
 					sourceResourceID: makeWikiNodeResourceID(workspaceID, n.NodeID),
 					url:              n.URL,
@@ -979,6 +1010,15 @@ func wikiRevisionKey(n wikiNodeItem) string {
 		return n.UpdatedTime
 	}
 	return fmt.Sprintf("%s:%d", n.NodeID, n.Size)
+}
+
+func sheetRevisionUnreliable(ref docRef) bool {
+	return ref.kind == dingtalkDocumentKindNativeSheet && !ref.revisionReliable
+}
+
+func sheetContentFingerprint(content []byte) string {
+	sum := sha256.Sum256(content)
+	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
 func extensionFromWikiNode(n wikiNodeItem) string {

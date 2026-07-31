@@ -1103,6 +1103,91 @@ func TestFetchIncremental_wikiSpreadsheetUsesWorkbookAPI(t *testing.T) {
 	}
 }
 
+func TestFetchIncremental_nativeSheetWithoutMetadataUsesContentFingerprint(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID: "sheet1", WorkspaceID: "wk1", Name: "在线表格.axls", Type: "FILE", Category: "SPREADSHEET",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
+	config := &types.DataSourceConfig{
+		Type:        types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{"app_key": cfg.AppKey, "app_secret": cfg.AppSecret, "base_url": cfg.BaseURL},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings:    map[string]interface{}{"union_id": "operator", "dingtalk_type": "wiki"},
+	}
+	connector := NewConnector()
+	first, cursor, err := connector.FetchIncremental(context.Background(), config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Metadata["dingtalk_doc_kind"] != string(dingtalkDocumentKindNativeSheet) {
+		t.Fatalf("first sync = %+v", first)
+	}
+	second, _, err := connector.FetchIncremental(context.Background(), config, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("unchanged sheet was re-emitted: %+v", second)
+	}
+	var saved dingtalkCursor
+	raw, _ := json.Marshal(cursor.ConnectorCursor)
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.SheetFingerprints[makeStableWikiDocExternalID("wk1", "sheet1")] == "" {
+		t.Fatalf("missing sheet fingerprint: %+v", saved)
+	}
+}
+
+func TestFetchIncremental_nativeSheetContentChangeIsDetectedWithoutMetadata(t *testing.T) {
+	var rangeCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", RootNodeID: "root1"}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{NodeID: "sheet1", WorkspaceID: "wk1", Name: "在线表格.axls", Type: "FILE", Category: "SPREADSHEET"}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/sheet1", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{NodeID: "sheet1", WorkspaceID: "wk1", Name: "在线表格.axls", Type: "FILE", Category: "SPREADSHEET"}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWorkbookSheetsResponse{Value: []workbookSheetItem{{ID: "tab1", Name: "Sheet1", RowCount: 2, ColumnCount: 2}}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets/tab1/ranges/A1:B2", func(w http.ResponseWriter, r *http.Request) {
+		rangeCalls++
+		value := "old"
+		if rangeCalls > 1 {
+			value = "new"
+		}
+		writeJSON(w, map[string]interface{}{"values": [][]string{{"字段", "值"}, {"状态", value}}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	config := &types.DataSourceConfig{
+		Type:        types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{"app_key": "key", "app_secret": "secret", "base_url": srv.URL},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings:    map[string]interface{}{"union_id": "operator", "dingtalk_type": "wiki"},
+	}
+	connector := NewConnector()
+	first, cursor, err := connector.FetchIncremental(context.Background(), config, nil)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first sync items=%+v err=%v", first, err)
+	}
+	second, _, err := connector.FetchIncremental(context.Background(), config, cursor)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("changed sheet items=%+v err=%v", second, err)
+	}
+	if !strings.Contains(string(second[0].Content), "new") {
+		t.Fatalf("changed content = %q", second[0].Content)
+	}
+}
+
 func TestFetchIncremental_wikiDocumentCategoryAxlsUsesWorkbookAPI(t *testing.T) {
 	nodes := []wikiNodeItem{{
 		NodeID:      "sheet1",
@@ -1491,6 +1576,28 @@ func TestSpreadsheetRangeAddressesRespectDingTalkCellLimit(t *testing.T) {
 		if cells > dingtalkSpreadsheetMaxCellsPerRange {
 			t.Fatalf("range %q has %d cells, exceeds %d", r, cells, dingtalkSpreadsheetMaxCellsPerRange)
 		}
+	}
+}
+
+func TestSheetContentFingerprint_isStableAndContentSensitive(t *testing.T) {
+	one := []byte("# Sheet\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n")
+	if got, want := sheetContentFingerprint(one), sheetContentFingerprint(one); got != want {
+		t.Fatalf("same content fingerprints differ: %q != %q", got, want)
+	}
+	if sheetContentFingerprint(one) == sheetContentFingerprint([]byte("# Sheet\n\n| A | B |\n| --- | --- |\n| 1 | 3 |\n")) {
+		t.Fatal("different sheet content produced the same fingerprint")
+	}
+}
+
+func TestSheetRevisionUnreliable_onlyMatchesNativeSheetWithoutMetadata(t *testing.T) {
+	if !sheetRevisionUnreliable(docRef{kind: dingtalkDocumentKindNativeSheet, revisionReliable: false}) {
+		t.Fatal("native sheet without metadata should require content probing")
+	}
+	if sheetRevisionUnreliable(docRef{kind: dingtalkDocumentKindNativeSheet, revisionReliable: true}) {
+		t.Fatal("native sheet with metadata should use normal revision checks")
+	}
+	if sheetRevisionUnreliable(docRef{kind: dingtalkDocumentKindNativeDoc, revisionReliable: false}) {
+		t.Fatal("native document should not require sheet probing")
 	}
 }
 
