@@ -364,14 +364,15 @@ func (c *Connector) sync(
 		var fileName string
 		var err error
 		if ref.kind == dingtalkDocumentKindUploadedFile {
-			items = append(items, skippedUploadedFileItem(ref))
-			continue
-		}
-		if ref.kind == dingtalkDocumentKindSkipped || ref.kind == dingtalkDocumentKindUnsupported {
+			if strings.TrimSpace(ref.spaceID) == "" || strings.TrimSpace(ref.dentryID) == "" {
+				items = append(items, skippedUploadedFileItem(ref))
+				continue
+			}
+			content, fileName, err = client.DownloadDocContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
+		} else if ref.kind == dingtalkDocumentKindSkipped || ref.kind == dingtalkDocumentKindUnsupported {
 			items = append(items, skippedUnsupportedOnlineItem(ref))
 			continue
-		}
-		if ref.docType == "wiki" {
+		} else if ref.docType == "wiki" {
 			switch ref.kind {
 			case dingtalkDocumentKindNativeSheet:
 				content, fileName, err = client.DownloadWikiSpreadsheetContent(ctx, ref.dentryID, ref.name)
@@ -761,8 +762,10 @@ func (c *Connector) collectWikiDocRefs(
 				spaceID := workspaceID
 				dentryID := n.NodeID
 				if kind == dingtalkDocumentKindUploadedFile {
-					spaceID = firstNonEmpty(n.SpaceID, workspaceID)
-					dentryID = firstNonEmpty(n.DentryID, n.FileID, n.NodeID)
+					// Knowledge-base node IDs are not storage dentry IDs. Only use
+					// the storage locator when DingTalk returned one explicitly.
+					spaceID = strings.TrimSpace(n.SpaceID)
+					dentryID = strings.TrimSpace(firstNonEmpty(n.DentryID, n.FileID))
 				} else if n.DocKey != "" {
 					dentryID = n.DocKey
 				} else if n.WorkbookID != "" {
