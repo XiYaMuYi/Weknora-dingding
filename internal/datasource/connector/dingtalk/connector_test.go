@@ -1389,8 +1389,9 @@ func TestFetchIncremental_emptyWikiSpreadsheetIsSkippedAndAdvancesRevision(t *te
 	}
 }
 
-func TestFetchIncremental_wikiUploadedSpreadsheetIsSkipped(t *testing.T) {
+func TestFetchIncremental_wikiUploadedSpreadsheetIsDownloaded(t *testing.T) {
 	mux := http.NewServeMux()
+	var srv *httptest.Server
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
@@ -1425,15 +1426,19 @@ func TestFetchIncremental_wikiUploadedSpreadsheetIsSkipped(t *testing.T) {
 		http.Error(w, `{"message":"not workbook"}`, http.StatusBadRequest)
 	})
 	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded spreadsheet should be skipped without requesting download info")
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/uploaded.xlsx"})
 	})
 	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded spreadsheet should be skipped without requesting legacy download info")
+		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded spreadsheet should be skipped without downloading bytes")
+		http.NotFound(w, r)
 	})
-	srv := httptest.NewServer(mux)
+	mux.HandleFunc("/download/uploaded.xlsx", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+		_, _ = w.Write([]byte("uploaded spreadsheet bytes"))
+	})
+	srv = httptest.NewServer(mux)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -1456,14 +1461,14 @@ func TestFetchIncremental_wikiUploadedSpreadsheetIsSkipped(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] == "" {
-		t.Fatalf("expected skip placeholder, got %+v", items[0].Metadata)
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] != "" {
+		t.Fatalf("expected downloaded attachment, got %+v", items[0].Metadata)
 	}
-	if len(items[0].Content) != 0 || items[0].FileName != "" {
-		t.Fatalf("skipped uploaded file should not contain bytes or filename, got file=%q len=%d", items[0].FileName, len(items[0].Content))
+	if string(items[0].Content) != "uploaded spreadsheet bytes" || items[0].FileName != "上传表格.xlsx" {
+		t.Fatalf("downloaded attachment content mismatch, got file=%q len=%d", items[0].FileName, len(items[0].Content))
 	}
-	if !strings.Contains(items[0].Metadata["skip_reason"], "转换为钉钉在线文档或在线表格") {
-		t.Fatalf("unexpected skip reason: %s", items[0].Metadata["skip_reason"])
+	if items[0].ContentType != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" {
+		t.Fatalf("content type = %q", items[0].ContentType)
 	}
 }
 
@@ -1678,8 +1683,9 @@ func TestFetchIncremental_wikiUploadedFileIsSkippedWithoutResolvingDentry(t *tes
 	}
 }
 
-func TestFetchIncremental_driveUploadedFileIsSkipped(t *testing.T) {
+func TestFetchIncremental_driveUploadedFileIsDownloaded(t *testing.T) {
 	mux := http.NewServeMux()
+	var srv *httptest.Server
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
@@ -1693,9 +1699,12 @@ func TestFetchIncremental_driveUploadedFileIsSkipped(t *testing.T) {
 		}}})
 	})
 	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries/file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded drive file should be skipped without requesting download info")
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/file1"})
 	})
-	srv := httptest.NewServer(mux)
+	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("uploaded drive file bytes"))
+	})
+	srv = httptest.NewServer(mux)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -1715,8 +1724,11 @@ func TestFetchIncremental_driveUploadedFileIsSkipped(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] == "" {
-		t.Fatalf("expected skip placeholder, got %+v", items[0].Metadata)
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] != "" {
+		t.Fatalf("expected downloaded attachment, got %+v", items[0].Metadata)
+	}
+	if string(items[0].Content) != "uploaded drive file bytes" {
+		t.Fatalf("downloaded content = %q", string(items[0].Content))
 	}
 }
 
