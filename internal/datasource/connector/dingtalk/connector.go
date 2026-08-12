@@ -368,7 +368,7 @@ func (c *Connector) sync(
 				items = append(items, skippedUploadedFileItem(ref))
 				continue
 			}
-			content, fileName, err = client.DownloadDocContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
+			content, fileName, err = client.DownloadUploadedFileContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
 		} else if ref.kind == dingtalkDocumentKindSkipped || ref.kind == dingtalkDocumentKindUnsupported {
 			items = append(items, skippedUnsupportedOnlineItem(ref))
 			continue
