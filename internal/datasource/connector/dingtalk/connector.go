@@ -563,14 +563,25 @@ func normalizeWikiDocumentKind(n wikiNodeItem) dingtalkDocumentKind {
 	category := strings.ToUpper(strings.TrimSpace(n.Category))
 	nameExt := wikiNodeNameExtension(n)
 	ext := extensionFromWikiNode(n)
-	if hasWikiUploadedFileLocator(n) {
-		return dingtalkDocumentKindUploadedFile
-	}
 	if isDingTalkNativeSpreadsheetExtension(nameExt) {
 		return dingtalkDocumentKindNativeSheet
 	}
 	if nameExt != "" && isDingTalkNativeOnlineDocExtension(nameExt) {
 		return dingtalkDocumentKindNativeDoc
+	}
+	// Native workbook nodes use the workbook API even when their display name
+	// happens to end in .xlsx; uploaded XLSX attachments are classified below
+	// by their DOCUMENT category and use storage download instead.
+	switch category {
+	case "SPREADSHEET", "SHEET", "ALISHEET", "WORKBOOK", "AIOBJECT", "AIBASE", "AIFORM":
+		return dingtalkDocumentKindNativeSheet
+	case "WHITEBOARD", "MINDNOTE", "MINDMAP", "FORM", "SLIDES", "PRESENTATION", "PDF":
+		return dingtalkDocumentKindSkipped
+	}
+	// A storage locator does not make an arbitrary binary an ingestible
+	// attachment. Format support must be decided before download routing.
+	if isSupportedUploadedFileExtension(nameExt) || isSupportedUploadedFileExtension(ext) {
+		return dingtalkDocumentKindUploadedFile
 	}
 	switch category {
 	case "ALIDOC", "DOC", "DOCUMENT":
@@ -581,20 +592,12 @@ func normalizeWikiDocumentKind(n wikiNodeItem) dingtalkDocumentKind {
 			return dingtalkDocumentKindSkipped
 		}
 		return dingtalkDocumentKindNativeDoc
-	case "SPREADSHEET", "SHEET", "ALISHEET", "WORKBOOK", "AIOBJECT", "AIBASE", "AIFORM":
-		return dingtalkDocumentKindNativeSheet
-	case "WHITEBOARD", "MINDNOTE", "MINDMAP", "FORM", "SLIDES", "PRESENTATION", "PDF":
-		return dingtalkDocumentKindSkipped
 	default:
 		if isSupportedUploadedFileExtension(ext) {
 			return dingtalkDocumentKindUploadedFile
 		}
 		return dingtalkDocumentKindSkipped
 	}
-}
-
-func hasWikiUploadedFileLocator(n wikiNodeItem) bool {
-	return strings.TrimSpace(n.SpaceID) != "" && strings.TrimSpace(firstNonEmpty(n.DentryID, n.FileID)) != ""
 }
 
 func (c *Connector) collectDocRefs(
