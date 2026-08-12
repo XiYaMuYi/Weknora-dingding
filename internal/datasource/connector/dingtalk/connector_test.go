@@ -1564,6 +1564,29 @@ func TestNormalizeWikiDocumentKind_DocumentNativeDocStaysNative(t *testing.T) {
 	}
 }
 
+func TestNormalizeWikiDocumentKind_UploadedUnsupportedFormatsAreSkipped(t *testing.T) {
+	for _, name := range []string{"archive.zip", "video.mp4", "drawing.dwg", "binary.exe", "unknown.bin"} {
+		got := normalizeWikiDocumentKind(wikiNodeItem{
+			NodeID: "file1", Name: name, Type: "FILE", Category: "DOCUMENT",
+			SpaceID: "storage-space", DentryID: "storage-file",
+		})
+		if got != dingtalkDocumentKindSkipped {
+			t.Fatalf("normalizeWikiDocumentKind(%q) = %q, want skipped", name, got)
+		}
+	}
+}
+
+func TestNormalizeWikiDocumentKind_UploadedSupportedFormatsAreDownloaded(t *testing.T) {
+	for _, name := range []string{"report.pdf", "report.docx", "table.xlsx", "slides.pptx", "data.json", "photo.png"} {
+		got := normalizeWikiDocumentKind(wikiNodeItem{
+			NodeID: "file1", Name: name, Type: "FILE", Category: "DOCUMENT",
+		})
+		if got != dingtalkDocumentKindUploadedFile {
+			t.Fatalf("normalizeWikiDocumentKind(%q) = %q, want uploaded_file", name, got)
+		}
+	}
+}
+
 func TestSpreadsheetRangeAddressesRespectDingTalkCellLimit(t *testing.T) {
 	got := spreadsheetRangeAddresses(0, 0)
 	want := []string{"A1:AX600", "A601:AX1000"}
