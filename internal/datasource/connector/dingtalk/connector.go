@@ -520,6 +520,7 @@ type docRef struct {
 	spaceID          string
 	dentryID         string
 	fileID           string
+	locatorError     string
 	name             string
 	extension        string
 	revision         string
@@ -764,12 +765,22 @@ func (c *Connector) collectWikiDocRefs(
 				spaceID := workspaceID
 				dentryID := n.NodeID
 				fileID := ""
+				locatorError := ""
 				if kind == dingtalkDocumentKindUploadedFile {
 					// Knowledge-base node IDs are not storage dentry IDs. Only use
 					// the storage locator when DingTalk returned one explicitly.
 					spaceID = strings.TrimSpace(n.SpaceID)
 					dentryID = strings.TrimSpace(firstNonEmpty(n.DentryID, n.FileID))
 					fileID = strings.TrimSpace(n.FileID)
+					if spaceID == "" || dentryID == "" {
+						if resolved, resolveErr := client.ResolveDentryIDByUUID(ctx, n.NodeID); resolveErr != nil {
+							logger.Warnf(ctx, "[DingTalk] resolve uploaded wiki attachment %s to storage dentry failed: %v", n.NodeID, resolveErr)
+							locatorError = resolveErr.Error()
+						} else {
+							spaceID = resolved.SpaceID
+							dentryID = resolved.DentryID
+						}
+					}
 				} else if n.DocKey != "" {
 					dentryID = n.DocKey
 				} else if n.WorkbookID != "" {
@@ -781,6 +792,7 @@ func (c *Connector) collectWikiDocRefs(
 					spaceID:          spaceID,
 					dentryID:         dentryID,
 					fileID:           fileID,
+					locatorError:     locatorError,
 					name:             n.Name,
 					extension:        extensionFromWikiNode(n),
 					revision:         wikiRevisionKey(n),
@@ -822,7 +834,7 @@ func skippedUploadedFileItem(ref docRef) types.FetchedItem {
 			"file_id":           ref.fileID,
 			"dingtalk_doc_type": ref.metadataDocType(),
 			"dingtalk_doc_kind": string(ref.kind),
-			"skip_reason":       dingtalkUploadedFileSkipReason(ref.name),
+			"skip_reason":       dingtalkUploadedFileSkipReason(ref.name, ref.locatorError),
 		},
 	}
 }
@@ -863,10 +875,13 @@ func skippedEmptySpreadsheetItem(ref docRef) types.FetchedItem {
 	}
 }
 
-func dingtalkUploadedFileSkipReason(name string) string {
+func dingtalkUploadedFileSkipReason(name, locatorError string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "该文件"
+	}
+	if strings.TrimSpace(locatorError) != "" {
+		return fmt.Sprintf("%s 是上传到钉钉的附件文件，调用知识库附件转换接口失败：%s", name, locatorError)
 	}
 	return fmt.Sprintf("%s 是上传到钉钉的附件文件，但钉钉未返回可用的钉盘 spaceId/dentryId，暂时无法下载。请确认应用具有企业存储文件下载权限，或在钉钉中重新上传后再同步。", name)
 }

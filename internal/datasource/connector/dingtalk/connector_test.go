@@ -1616,8 +1616,9 @@ func rowNumberFromCell(cell string) int {
 	return row
 }
 
-func TestFetchIncremental_wikiUploadedFileIsSkippedWithoutResolvingDentry(t *testing.T) {
+func TestFetchIncremental_wikiUploadedFileResolvesAndDownloads(t *testing.T) {
 	mux := http.NewServeMux()
+	var srv *httptest.Server
 	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
@@ -1647,15 +1648,15 @@ func TestFetchIncremental_wikiUploadedFileIsSkippedWithoutResolvingDentry(t *tes
 		}})
 	})
 	mux.HandleFunc("/v2.0/doc/dentries/wiki-dentry-uuid/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded file should be skipped without resolving dentry id")
+		writeJSON(w, dentryIDByUUIDResponse{DentryUUID: "wiki-dentry-uuid", DentryID: "drive-file1", SpaceID: "drive-sp1"})
 	})
 	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded file should be skipped without requesting download info")
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/file1"})
 	})
 	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("uploaded file should be skipped without downloading bytes")
+		_, _ = w.Write([]byte("uploaded wiki attachment"))
 	})
-	srv := httptest.NewServer(mux)
+	srv = httptest.NewServer(mux)
 	defer srv.Close()
 
 	dsConfig := &types.DataSourceConfig{
@@ -1678,8 +1679,11 @@ func TestFetchIncremental_wikiUploadedFileIsSkippedWithoutResolvingDentry(t *tes
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] == "" {
-		t.Fatalf("expected skip placeholder, got %+v", items[0].Metadata)
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] != "" {
+		t.Fatalf("expected downloaded attachment, got %+v", items[0].Metadata)
+	}
+	if string(items[0].Content) != "uploaded wiki attachment" {
+		t.Fatalf("downloaded content = %q", string(items[0].Content))
 	}
 }
 
