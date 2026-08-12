@@ -516,8 +516,10 @@ func appendDingTalkDocListFailureItems(items []types.FetchedItem, failures []doc
 
 type docRef struct {
 	externalID       string
+	nodeID           string
 	spaceID          string
 	dentryID         string
+	fileID           string
 	name             string
 	extension        string
 	revision         string
@@ -761,11 +763,13 @@ func (c *Connector) collectWikiDocRefs(
 				}
 				spaceID := workspaceID
 				dentryID := n.NodeID
+				fileID := ""
 				if kind == dingtalkDocumentKindUploadedFile {
 					// Knowledge-base node IDs are not storage dentry IDs. Only use
 					// the storage locator when DingTalk returned one explicitly.
 					spaceID = strings.TrimSpace(n.SpaceID)
 					dentryID = strings.TrimSpace(firstNonEmpty(n.DentryID, n.FileID))
+					fileID = strings.TrimSpace(n.FileID)
 				} else if n.DocKey != "" {
 					dentryID = n.DocKey
 				} else if n.WorkbookID != "" {
@@ -773,8 +777,10 @@ func (c *Connector) collectWikiDocRefs(
 				}
 				refs = append(refs, docRef{
 					externalID:       makeStableWikiDocExternalID(workspaceID, n.NodeID),
+					nodeID:           n.NodeID,
 					spaceID:          spaceID,
 					dentryID:         dentryID,
+					fileID:           fileID,
 					name:             n.Name,
 					extension:        extensionFromWikiNode(n),
 					revision:         wikiRevisionKey(n),
@@ -810,8 +816,10 @@ func skippedUploadedFileItem(ref docRef) types.FetchedItem {
 		SourceResourceID: ref.sourceResourceID,
 		Metadata: map[string]string{
 			"channel":           types.ChannelDingtalk,
+			"node_id":           ref.nodeID,
 			"space_id":          ref.spaceID,
 			"dentry_id":         ref.dentryID,
+			"file_id":           ref.fileID,
 			"dingtalk_doc_type": ref.metadataDocType(),
 			"dingtalk_doc_kind": string(ref.kind),
 			"skip_reason":       dingtalkUploadedFileSkipReason(ref.name),
@@ -827,8 +835,10 @@ func skippedUnsupportedOnlineItem(ref docRef) types.FetchedItem {
 		SourceResourceID: ref.sourceResourceID,
 		Metadata: map[string]string{
 			"channel":           types.ChannelDingtalk,
+			"node_id":           ref.nodeID,
 			"space_id":          ref.spaceID,
 			"dentry_id":         ref.dentryID,
+			"file_id":           ref.fileID,
 			"dingtalk_doc_type": ref.metadataDocType(),
 			"dingtalk_doc_kind": string(ref.kind),
 			"skip_reason":       dingtalkUnsupportedOnlineSkipReason(ref.name, ref.extension),

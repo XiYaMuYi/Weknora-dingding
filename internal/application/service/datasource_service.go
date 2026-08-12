@@ -724,7 +724,17 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 				result.Failed++
 				result.Errors = append(result.Errors, fmt.Sprintf("%s: %s", item.Title, errMsg))
 			} else {
-				logger.Infof(ctx, "skipping item %q (external_id=%s): no content or URL", item.Title, item.ExternalID)
+				logger.Infof(ctx, "skipping item %q (external_id=%s): no content or URL; dingtalk_doc_type=%s dingtalk_doc_kind=%s node_id=%s space_id=%s dentry_id=%s file_id=%s skip_reason=%s",
+					item.Title,
+					item.ExternalID,
+					item.Metadata["dingtalk_doc_type"],
+					item.Metadata["dingtalk_doc_kind"],
+					item.Metadata["node_id"],
+					item.Metadata["space_id"],
+					item.Metadata["dentry_id"],
+					item.Metadata["file_id"],
+					item.Metadata["skip_reason"],
+				)
 				result.Skipped++
 				if reason := strings.TrimSpace(item.Metadata["skip_reason"]); reason != "" {
 					result.SkippedDetails = append(result.SkippedDetails, fmt.Sprintf("%s: %s", item.Title, reason))
