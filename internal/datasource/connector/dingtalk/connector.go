@@ -858,7 +858,7 @@ func dingtalkUploadedFileSkipReason(name string) string {
 	if name == "" {
 		name = "该文件"
 	}
-	return fmt.Sprintf("%s 是上传到钉钉的附件文件，当前版本暂不支持同步上传附件。请在钉钉中将它转换为钉钉在线文档或在线表格后再重新同步。", name)
+	return fmt.Sprintf("%s 是上传到钉钉的附件文件，但钉钉未返回可用的钉盘 spaceId/dentryId，暂时无法下载。请确认应用具有企业存储文件下载权限，或在钉钉中重新上传后再同步。", name)
 }
 
 func dingtalkUnsupportedOnlineSkipReason(name, extension string) string {
