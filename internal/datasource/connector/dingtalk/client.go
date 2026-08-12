@@ -342,6 +342,21 @@ func (c *Client) DownloadDocContent(ctx context.Context, spaceID, dentryID, name
 		return c.downloadViaExportFallback(ctx, token, spaceID, dentryID, name, extension, nil)
 	}
 
+	return c.downloadUploadedFileContentWithToken(ctx, token, spaceID, dentryID, name, extension)
+}
+
+// DownloadUploadedFileContent downloads a file stored as an attachment in a
+// DingTalk knowledge-base node. Attachments must use the storage download API
+// even when their extension is docx/xlsx; they are not online documents.
+func (c *Client) DownloadUploadedFileContent(ctx context.Context, spaceID, dentryID, name, extension string) ([]byte, string, error) {
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return c.downloadUploadedFileContentWithToken(ctx, token, spaceID, dentryID, name, extension)
+}
+
+func (c *Client) downloadUploadedFileContentWithToken(ctx context.Context, token, spaceID, dentryID, name, extension string) ([]byte, string, error) {
 	// Try the current download-info API first, then GET URL with returned headers.
 	path := fmt.Sprintf("/v1.0/storage/spaces/%s/dentries/%s/downloadInfos",
 		url.PathEscape(spaceID), url.PathEscape(dentryID))

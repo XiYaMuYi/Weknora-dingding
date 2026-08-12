@@ -1631,7 +1631,7 @@ func TestFetchIncremental_wikiUploadedFileResolvesAndDownloads(t *testing.T) {
 		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{
 			NodeID:      "wiki-dentry-uuid",
 			WorkspaceID: "wk1",
-			Name:        "制度.pdf",
+			Name:        "制度.docx",
 			Type:        "FILE",
 			Category:    "DOCUMENT",
 			UpdatedTime: "2026-06-01T00:00:00Z",
@@ -1641,7 +1641,7 @@ func TestFetchIncremental_wikiUploadedFileResolvesAndDownloads(t *testing.T) {
 		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{
 			NodeID:      "wiki-dentry-uuid",
 			WorkspaceID: "wk1",
-			Name:        "制度.pdf",
+			Name:        "制度.docx",
 			Type:        "FILE",
 			Category:    "DOCUMENT",
 			UpdatedTime: "2026-06-01T00:00:00Z",
@@ -1652,6 +1652,9 @@ func TestFetchIncremental_wikiUploadedFileResolvesAndDownloads(t *testing.T) {
 	})
 	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/file1"})
+	})
+	mux.HandleFunc("/v1.0/doc/documents/drive-file1/content", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("uploaded docx must use storage download, not online doc content")
 	})
 	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("uploaded wiki attachment"))
