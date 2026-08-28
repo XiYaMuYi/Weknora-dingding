@@ -224,10 +224,17 @@ func (s *ossFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	client := s.client
 	objectName := fmt.Sprintf("%s%d/exports/%s%s", s.pathPrefix, tenantID, uuid.New().String(), ext)
 
-	if temp && s.tempClient != nil {
-		targetBucket = s.tempBucketName
-		client = s.tempClient
-		objectName = fmt.Sprintf("exports/%d/%s%s", tenantID, uuid.New().String(), ext)
+	if temp {
+		// Keep processing originals under an explicit lifecycle prefix even
+		// when a separate temporary bucket is not configured. Operators can
+		// safely apply a three-day expiration rule to tmp/processing/ without
+		// touching permanent exports.
+		objectName = fmt.Sprintf("%stmp/processing/%d/%s%s", s.pathPrefix, tenantID, uuid.New().String(), ext)
+		if s.tempClient != nil {
+			targetBucket = s.tempBucketName
+			client = s.tempClient
+			objectName = fmt.Sprintf("tmp/processing/%d/%s%s", tenantID, uuid.New().String(), ext)
+		}
 	}
 
 	_, err = client.PutObject(ctx, &oss.PutObjectRequest{

@@ -150,6 +150,10 @@ type Knowledge struct {
 	FileHash string `json:"file_hash"`
 	// File path of the knowledge
 	FilePath string `json:"file_path"`
+	// CompressionInfo records the immutable original fingerprint and the
+	// currently stored representation. It is metadata only; FileHash remains
+	// the original upload hash so duplicate detection keeps its old semantics.
+	CompressionInfo JSON `json:"compression_info" gorm:"type:json"`
 	// Storage size of the knowledge
 	StorageSize int64 `json:"storage_size"`
 	// Metadata of the knowledge

@@ -4,9 +4,9 @@ package types
 // router.NewAsynqServer — a task enqueued to a queue that the server does not
 // list will never be consumed.
 const (
-	QueueCritical   = "critical"
-	QueueDefault    = "default"
-	QueueLow        = "low"
+	QueueCritical = "critical"
+	QueueDefault  = "default"
+	QueueLow      = "low"
 	// QueueMultimodal isolates high-volume, slow VLM image tasks (OCR + caption)
 	// so a single large scanned PDF (hundreds–thousands of page images) cannot
 	// saturate the shared worker pool and block user-facing document parsing in
@@ -24,23 +24,24 @@ const (
 )
 
 const (
-	TypeChunkExtract         = "chunk:extract"
-	TypeDocumentProcess      = "document:process"       // 文档处理任务
-	TypeFAQImport            = "faq:import"             // FAQ导入任务（包含dry run模式）
-	TypeQuestionGeneration   = "question:generation"    // 问题生成任务
-	TypeSummaryGeneration    = "summary:generation"     // 摘要生成任务
-	TypeKBClone              = "kb:clone"               // 知识库复制任务
-	TypeIndexDelete          = "index:delete"           // 索引删除任务
-	TypeKBDelete             = "kb:delete"              // 知识库删除任务
-	TypeKnowledgeListDelete  = "knowledge:list_delete"  // 批量删除知识任务
-	TypeKnowledgeListReparse = "knowledge:list_reparse" // 批量重解析知识任务
-	TypeKnowledgeMove        = "knowledge:move"         // 知识移动任务
-	TypeDataTableSummary     = "datatable:summary"      // 表格摘要任务
-	TypeImageMultimodal      = "image:multimodal"       // 图片多模态处理任务（OCR + VLM Caption）
-	TypeKnowledgePostProcess = "knowledge:post_process" // 知识后处理任务（统一调度）
-	TypeManualProcess        = "manual:process"         // 手工知识更新任务（cleanup + 重新索引）
-	TypeDataSourceSync       = "datasource:sync"        // 数据源同步任务
-	TypeWikiIngest           = "wiki:ingest"            // Wiki 页面同步任务
+	TypeChunkExtract           = "chunk:extract"
+	TypeDocumentProcess        = "document:process"         // 文档处理任务
+	TypeFAQImport              = "faq:import"               // FAQ导入任务（包含dry run模式）
+	TypeQuestionGeneration     = "question:generation"      // 问题生成任务
+	TypeSummaryGeneration      = "summary:generation"       // 摘要生成任务
+	TypeKBClone                = "kb:clone"                 // 知识库复制任务
+	TypeIndexDelete            = "index:delete"             // 索引删除任务
+	TypeKBDelete               = "kb:delete"                // 知识库删除任务
+	TypeKnowledgeListDelete    = "knowledge:list_delete"    // 批量删除知识任务
+	TypeKnowledgeListReparse   = "knowledge:list_reparse"   // 批量重解析知识任务
+	TypeKnowledgeMove          = "knowledge:move"           // 知识移动任务
+	TypeDataTableSummary       = "datatable:summary"        // 表格摘要任务
+	TypeImageMultimodal        = "image:multimodal"         // 图片多模态处理任务（OCR + VLM Caption）
+	TypeKnowledgePostProcess   = "knowledge:post_process"   // 知识后处理任务（统一调度）
+	TypeManualProcess          = "manual:process"           // 手工知识更新任务（cleanup + 重新索引）
+	TypeDataSourceSync         = "datasource:sync"          // 数据源同步任务
+	TypeWikiIngest             = "wiki:ingest"              // Wiki 页面同步任务
+	TypeKnowledgeImageCompress = "knowledge:image_compress" // 存量知识图片压缩任务
 )
 
 // ExtractChunkPayload represents the extract chunk task payload
@@ -61,19 +62,66 @@ type ExtractChunkPayload struct {
 	ChunkIndex int `json:"chunk_index,omitempty"`
 }
 
+// KnowledgeImageCompressionPayload is one complete batch round. Asynq itself
+// does not retry it: transient item failures are collected and enqueued only
+// after every item in the current round has had a chance to run.
+type KnowledgeImageCompressionPayload struct {
+	TenantID     uint64   `json:"tenant_id"`
+	TaskID       string   `json:"task_id"`
+	KBID         string   `json:"kb_id"`
+	KnowledgeIDs []string `json:"knowledge_ids"`
+	RetryRound   int      `json:"retry_round"`
+}
+
+type KnowledgeImageCompressionPreview struct {
+	KBID             string `json:"kb_id"`
+	EligibleImages   int    `json:"eligible_images"`
+	TotalSourceBytes int64  `json:"total_source_bytes"`
+	TargetBytes      int64  `json:"target_bytes"`
+}
+
+type KnowledgeImageCompressionProgress struct {
+	TaskID             string            `json:"task_id"`
+	KBID               string            `json:"kb_id"`
+	Status             KBCloneTaskStatus `json:"status"`
+	Total              int               `json:"total"`
+	Processed          int               `json:"processed"`
+	BatchesRemaining   int               `json:"batches_remaining"`
+	ActiveBatches      int               `json:"active_batches"`
+	Succeeded          int               `json:"succeeded"`
+	Skipped            int               `json:"skipped"`
+	PermanentFailed    int               `json:"permanent_failed"`
+	Failed             int               `json:"failed"`
+	Retrying           int               `json:"retrying"`
+	RetryRound         int               `json:"retry_round"`
+	BytesBefore        int64             `json:"bytes_before"`
+	BytesAfter         int64             `json:"bytes_after"`
+	SavedBytes         int64             `json:"saved_bytes"`
+	FailedKnowledgeIDs []string          `json:"failed_knowledge_ids,omitempty"`
+	Errors             map[string]string `json:"errors,omitempty"`
+	Message            string            `json:"message"`
+	CreatedAt          int64             `json:"created_at"`
+	UpdatedAt          int64             `json:"updated_at"`
+}
+
 // DocumentProcessPayload represents the document process task payload
 type DocumentProcessPayload struct {
 	TracingContext
-	RequestId                string   `json:"request_id"`
-	TenantID                 uint64   `json:"tenant_id"`
-	KnowledgeID              string   `json:"knowledge_id"`
-	KnowledgeBaseID          string   `json:"knowledge_base_id"`
-	FilePath                 string   `json:"file_path,omitempty"` // 文件路径（文件导入时使用）
-	FileName                 string   `json:"file_name,omitempty"` // 文件名（文件导入时使用）
-	FileType                 string   `json:"file_type,omitempty"` // 文件类型（文件导入时使用）
-	URL                      string   `json:"url,omitempty"`       // URL（URL导入时使用）
-	FileURL                  string   `json:"file_url,omitempty"`  // 文件资源链接（file_url导入时使用）
-	Passages                 []string `json:"passages,omitempty"`  // 文本段落（文本导入时使用）
+	RequestId       string `json:"request_id"`
+	TenantID        uint64 `json:"tenant_id"`
+	KnowledgeID     string `json:"knowledge_id"`
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	FilePath        string `json:"file_path,omitempty"` // 文件路径（文件导入时使用）
+	FileName        string `json:"file_name,omitempty"` // 文件名（文件导入时使用）
+	FileType        string `json:"file_type,omitempty"` // 文件类型（文件导入时使用）
+	// DeleteSourceAfterProcess marks FilePath as a temporary source object.
+	// The document worker keeps it across retryable and asynchronous processing;
+	// it deletes it after a final failed attempt. Successful sources are removed
+	// by the configured temporary-object lifecycle until final-stage cleanup runs.
+	DeleteSourceAfterProcess bool     `json:"delete_source_after_process,omitempty"`
+	URL                      string   `json:"url,omitempty"`      // URL（URL导入时使用）
+	FileURL                  string   `json:"file_url,omitempty"` // 文件资源链接（file_url导入时使用）
+	Passages                 []string `json:"passages,omitempty"` // 文本段落（文本导入时使用）
 	EnableMultimodel         bool     `json:"enable_multimodel"`
 	EnableQuestionGeneration bool     `json:"enable_question_generation"` // 是否启用问题生成
 	QuestionCount            int      `json:"question_count,omitempty"`   // 每个chunk生成的问题数量
@@ -205,8 +253,8 @@ type KnowledgeListDeletePayload struct {
 // KnowledgeListReparsePayload represents the batch knowledge reparse task payload
 type KnowledgeListReparsePayload struct {
 	TracingContext
-	TenantID      uint64                      `json:"tenant_id"`
-	KnowledgeIDs  []string                    `json:"knowledge_ids"`
+	TenantID      uint64                     `json:"tenant_id"`
+	KnowledgeIDs  []string                   `json:"knowledge_ids"`
 	ProcessConfig *KnowledgeProcessOverrides `json:"process_config,omitempty"`
 }
 

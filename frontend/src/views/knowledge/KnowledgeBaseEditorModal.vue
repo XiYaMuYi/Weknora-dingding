@@ -360,6 +360,11 @@
                   />
                 </div>
 
+                <!-- 存量知识图片压缩（仅编辑模式） -->
+                <div v-if="mode === 'edit' && kbId && !isFAQ && currentSection === 'imageCompression'" class="section">
+                  <KBImageCompressionSettings :kb-id="kbId" />
+                </div>
+
                 <!-- 数据源管理（仅编辑模式） -->
                 <div v-if="mode === 'edit' && kbId && currentSection === 'datasource'" class="section">
                   <DataSourceSettings :kb-id="kbId" @count="dsCount = $event" />
@@ -409,6 +414,7 @@ import KBStorageSettings from './settings/KBStorageSettings.vue'
 import KBChunkingSettings from './settings/KBChunkingSettings.vue'
 import KBVectorStoreSettings from './settings/KBVectorStoreSettings.vue'
 import KBAdvancedSettings from './settings/KBAdvancedSettings.vue'
+import KBImageCompressionSettings from './settings/KBImageCompressionSettings.vue'
 import ModelSelector from '@/components/ModelSelector.vue'
 import GraphSettings from './settings/GraphSettings.vue'
 import KBShareSettings from './settings/KBShareSettings.vue'
@@ -544,6 +550,7 @@ const navItems = computed(() => {
     )
     if (props.mode === 'edit' && props.kbId) {
       items.push({ key: 'datasource', icon: 'cloud-download', label: t('knowledgeEditor.sidebar.datasource'), badge: dsCount.value || undefined })
+      items.push({ key: 'imageCompression', icon: 'image', label: t('knowledgeEditor.sidebar.imageCompression') })
     }
   }
   if (props.mode === 'edit' && props.kbId && !authStore.isLiteMode) {
@@ -571,7 +578,7 @@ const navGroups = computed(() => {
     {
       key: 'data',
       label: t('knowledgeEditor.navGroups.data'),
-      items: pickItems(['storage', 'datasource']),
+      items: pickItems(['storage', 'imageCompression', 'datasource']),
     },
     {
       key: 'integration',
@@ -1896,4 +1903,3 @@ watch(
   }
 }
 </style>
-

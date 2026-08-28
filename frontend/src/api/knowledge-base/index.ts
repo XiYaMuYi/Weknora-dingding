@@ -127,6 +127,45 @@ export function rebuildKBIndex(kbId: string) {
   return post(`/api/v1/knowledge-bases/${kbId}/rebuild-index`, {});
 }
 
+export interface KnowledgeImageCompressionPreview {
+  kb_id: string;
+  eligible_images: number;
+  total_source_bytes: number;
+  target_bytes: number;
+}
+
+export interface KnowledgeImageCompressionProgress {
+  task_id: string;
+  kb_id: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  total: number;
+  processed: number;
+  succeeded: number;
+  skipped: number;
+  permanent_failed: number;
+  failed: number;
+  retrying: number;
+  retry_round: number;
+  bytes_before: number;
+  bytes_after: number;
+  saved_bytes: number;
+  failed_knowledge_ids?: string[];
+  errors?: Record<string, string>;
+  message: string;
+}
+
+export function previewKnowledgeImageCompression(kbId: string) {
+  return get(`/api/v1/knowledge-bases/${kbId}/knowledge/image-compression/preview`);
+}
+
+export function startKnowledgeImageCompression(kbId: string) {
+  return post(`/api/v1/knowledge-bases/${kbId}/knowledge/image-compression`, {});
+}
+
+export function getKnowledgeImageCompressionProgress(kbId: string, taskId: string) {
+  return get(`/api/v1/knowledge-bases/${kbId}/knowledge/image-compression/${taskId}`);
+}
+
 export function deleteKnowledgeBase(id: string) {
   return del(`/api/v1/knowledge-bases/${id}`);
 }

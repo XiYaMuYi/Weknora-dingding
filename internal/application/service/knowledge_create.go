@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/url"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	werrors "github.com/Tencent/WeKnora/internal/errors"
+	"github.com/Tencent/WeKnora/internal/imagecompression"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -210,13 +212,56 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		}
 	}
 
-	// Save the file to storage (use KB-level storage engine if configured)
+	// Save the file to storage (use KB-level storage engine if configured).
+	// Images retain the original only as a temporary first-pass RAG source;
+	// the permanent object is the bounded compressed representation.
 	logger.Infof(ctx, "Saving file, knowledge ID: %s", knowledge.ID)
 	fileSvc := s.resolveFileService(ctx, kb)
-	filePath, err := fileSvc.SaveFile(ctx, file, knowledge.TenantID, knowledge.ID)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to save file, knowledge ID: %s, error: %v", knowledge.ID, err)
-		return nil, err
+	processingFilePath := ""
+	processingFileName := safeFilename
+	processingFileType := getFileType(safeFilename)
+	deleteProcessingSource := false
+	savedPaths := make([]string, 0, 2)
+
+	var filePath string
+	if IsImageType(processingFileType) {
+		originalData, readErr := readUploadedFile(file)
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read uploaded image: %w", readErr)
+		}
+		compressed, compressErr := imagecompression.Compress(originalData, safeFilename, imagecompression.DefaultConfig())
+		if compressErr != nil {
+			return nil, werrors.NewBadRequestError("图片无法安全压缩到 1MB 以下").WithDetails(compressErr.Error())
+		}
+		filePath, err = fileSvc.SaveBytes(ctx, compressed.Data, knowledge.TenantID, compressed.FileName, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to save compressed image: %w", err)
+		}
+		savedPaths = append(savedPaths, filePath)
+		knowledge.Title = compressed.FileName
+		knowledge.FileName = compressed.FileName
+		knowledge.FileType = compressed.Format
+		knowledge.FileSize = compressed.CompressedSize
+		knowledge.CompressionInfo = buildImageCompressionInfo(compressed, "upload")
+		if compressed.Compressed {
+			processingFilePath, err = fileSvc.SaveBytes(ctx, originalData, knowledge.TenantID, safeFilename, true)
+			if err != nil {
+				_ = fileSvc.DeleteFile(ctx, filePath)
+				return nil, fmt.Errorf("failed to save temporary original image: %w", err)
+			}
+			savedPaths = append(savedPaths, processingFilePath)
+			deleteProcessingSource = true
+		} else {
+			processingFilePath = filePath
+		}
+	} else {
+		filePath, err = fileSvc.SaveFile(ctx, file, knowledge.TenantID, knowledge.ID)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to save file, knowledge ID: %s, error: %v", knowledge.ID, err)
+			return nil, err
+		}
+		savedPaths = append(savedPaths, filePath)
+		processingFilePath = filePath
 	}
 	knowledge.FilePath = filePath
 
@@ -224,8 +269,10 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 	logger.Info(ctx, "Saving knowledge record to database")
 	if err := s.repo.CreateKnowledge(ctx, knowledge); err != nil {
 		logger.Errorf(ctx, "Failed to create knowledge record, ID: %s, error: %v", knowledge.ID, err)
-		if deleteErr := fileSvc.DeleteFile(ctx, filePath); deleteErr != nil {
-			logger.Errorf(ctx, "Failed to delete saved file after knowledge creation failed, path: %s, error: %v", filePath, deleteErr)
+		for _, savedPath := range savedPaths {
+			if deleteErr := fileSvc.DeleteFile(ctx, savedPath); deleteErr != nil {
+				logger.Errorf(ctx, "Failed to delete saved file after knowledge creation failed, path: %s, error: %v", savedPath, deleteErr)
+			}
 		}
 		return nil, err
 	}
@@ -233,6 +280,9 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 	// Set tag relations
 	if err := s.setAndAttachKnowledgeTags(ctx, tenantID, kbID, knowledge, tagIDs); err != nil {
 		logger.Errorf(ctx, "Failed to set knowledge tags, knowledge ID: %s, error: %v", knowledge.ID, err)
+		if deleteProcessingSource {
+			_ = fileSvc.DeleteFile(ctx, processingFilePath)
+		}
 		return nil, err
 	}
 
@@ -251,9 +301,10 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
 		KnowledgeBaseID:          kbID,
-		FilePath:                 filePath,
-		FileName:                 safeFilename,
-		FileType:                 getFileType(safeFilename),
+		FilePath:                 processingFilePath,
+		FileName:                 processingFileName,
+		FileType:                 processingFileType,
+		DeleteSourceAfterProcess: deleteProcessingSource,
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
@@ -265,6 +316,9 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 	if err != nil {
 		logger.Errorf(ctx, "Failed to marshal document process task payload: %v", err)
 		// 即使入队失败，也返回knowledge，因为文件已保存
+		if deleteProcessingSource {
+			_ = fileSvc.DeleteFile(ctx, processingFilePath)
+		}
 		return knowledge, nil
 	}
 
@@ -277,6 +331,9 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 	if err != nil {
 		logger.Errorf(ctx, "Failed to enqueue document process task: %v", err)
 		// 即使入队失败，也返回knowledge，因为文件已保存
+		if deleteProcessingSource {
+			_ = fileSvc.DeleteFile(ctx, processingFilePath)
+		}
 		return knowledge, nil
 	}
 	logger.Infof(
@@ -293,6 +350,48 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 
 	logger.Infof(ctx, "Knowledge from file created successfully, ID: %s", knowledge.ID)
 	return knowledge, nil
+}
+
+const maxImageUploadBytes = 100 * 1024 * 1024
+
+func readUploadedFile(file *multipart.FileHeader) ([]byte, error) {
+	source, err := file.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer source.Close()
+	data, err := io.ReadAll(io.LimitReader(source, maxImageUploadBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxImageUploadBytes {
+		return nil, fmt.Errorf("image exceeds %dMiB safety limit", maxImageUploadBytes/(1024*1024))
+	}
+	return data, nil
+}
+
+func buildImageCompressionInfo(result imagecompression.Result, source string) types.JSON {
+	info := map[string]interface{}{
+		"status":            "completed",
+		"source":            source,
+		"compressed":        result.Compressed,
+		"original_size":     result.OriginalSize,
+		"stored_size":       result.CompressedSize,
+		"original_hash":     result.OriginalHash,
+		"original_format":   result.OriginalFormat,
+		"stored_hash":       result.StoredHash,
+		"stored_format":     result.Format,
+		"width":             result.Width,
+		"height":            result.Height,
+		"compression_ratio": result.CompressionRatio,
+		"algorithm_version": result.AlgorithmVersion,
+		"compressed_at":     time.Now().UTC(),
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return nil
+	}
+	return types.JSON(data)
 }
 
 // CreateKnowledgeFromURL creates a knowledge entry from a URL source

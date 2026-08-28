@@ -76,6 +76,7 @@ CREATE TABLE knowledges (
     file_size BIGINT,
     file_path TEXT,
     file_hash VARCHAR(64),
+    compression_info JSON DEFAULT NULL,
     storage_size BIGINT NOT NULL DEFAULT 0,
     metadata JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

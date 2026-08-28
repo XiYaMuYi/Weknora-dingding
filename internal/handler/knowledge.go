@@ -37,6 +37,44 @@ type KnowledgeHandler struct {
 	spanRepo          repository.KnowledgeSpanRepository
 }
 
+// PreviewImageCompression returns a DB-only estimate for completed image
+// knowledge in the selected KB. It does not download or mutate any object.
+func (h *KnowledgeHandler) PreviewImageCompression(c *gin.Context) {
+	ctx := c.Request.Context()
+	preview, err := h.kgService.PreviewKnowledgeImageCompression(ctx, c.Param("id"))
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": preview})
+}
+
+// StartImageCompression starts the low-priority historical image migration.
+func (h *KnowledgeHandler) StartImageCompression(c *gin.Context) {
+	ctx := c.Request.Context()
+	taskID, err := h.kgService.StartKnowledgeImageCompression(ctx, c.Param("id"))
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"success": true, "data": gin.H{"task_id": taskID}})
+}
+
+// GetImageCompressionProgress returns cumulative progress across all retry rounds.
+func (h *KnowledgeHandler) GetImageCompressionProgress(c *gin.Context) {
+	ctx := c.Request.Context()
+	progress, err := h.kgService.GetKnowledgeImageCompressionProgress(ctx, c.Param("task_id"))
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	if progress.KBID != c.Param("id") {
+		c.Error(errors.NewNotFoundError("Image compression task not found"))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": progress})
+}
+
 // NewKnowledgeHandler creates a new knowledge handler instance
 func NewKnowledgeHandler(
 	kgService interfaces.KnowledgeService,

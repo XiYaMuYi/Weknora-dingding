@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
+	"github.com/Tencent/WeKnora/internal/imagecompression"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -48,7 +49,11 @@ func (h *Handler) saveImageAttachments(ctx context.Context, images []ImageAttach
 		}
 
 		storedName := fmt.Sprintf("chat-images/%s%s", uuid.New().String(), ext)
-		fileURL, err := fileSvc.SaveBytes(ctx, imgBytes, tenantID, storedName, false)
+		compressed, err := imagecompression.Compress(imgBytes, storedName, imagecompression.DefaultConfig())
+		if err != nil {
+			return fmt.Errorf("compress image %d: %w", i, err)
+		}
+		fileURL, err := fileSvc.SaveBytes(ctx, compressed.Data, tenantID, compressed.FileName, false)
 		if err != nil {
 			return fmt.Errorf("save image %d: %w", i, err)
 		}
@@ -135,6 +140,12 @@ func mimeToExt(mime string) string {
 		return ".gif"
 	case "image/webp":
 		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	case "image/tiff", "image/tif":
+		return ".tiff"
+	case "image/svg+xml":
+		return ".svg"
 	default:
 		return ".png"
 	}

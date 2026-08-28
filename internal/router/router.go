@@ -293,6 +293,9 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		kb.POST("/file", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.CreateKnowledgeFromFile)
 		kb.POST("/url", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.CreateKnowledgeFromURL)
 		kb.POST("/manual", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.CreateManualKnowledge)
+		kb.GET("/image-compression/preview", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.PreviewImageCompression)
+		kb.POST("/image-compression", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.StartImageCompression)
+		kb.GET("/image-compression/:task_id", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.GetImageCompressionProgress)
 		kb.GET("", g.Viewer(), g.KBAccessRead("id"), handler.ListKnowledge)
 		// Clearing all contents under a KB is a destructive op; gate
 		// behind Admin instead of Contributor.

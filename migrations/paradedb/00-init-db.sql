@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS knowledges (
     file_size BIGINT,
     file_path TEXT,
     file_hash VARCHAR(64),
+    compression_info JSONB,
     storage_size BIGINT NOT NULL DEFAULT 0, -- 存储大小(Byte)
     metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,

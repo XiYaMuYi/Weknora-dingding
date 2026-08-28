@@ -180,6 +180,14 @@ type KnowledgeService interface {
 	ProcessKnowledgeListDelete(ctx context.Context, t *asynq.Task) error
 	// ProcessKnowledgeListReparse handles Asynq knowledge list reparse tasks
 	ProcessKnowledgeListReparse(ctx context.Context, t *asynq.Task) error
+	// PreviewKnowledgeImageCompression performs a DB-only dry run for completed
+	// image knowledge in one KB.
+	PreviewKnowledgeImageCompression(ctx context.Context, kbID string) (*types.KnowledgeImageCompressionPreview, error)
+	// StartKnowledgeImageCompression enqueues the first low-priority batch.
+	StartKnowledgeImageCompression(ctx context.Context, kbID string) (string, error)
+	// ProcessKnowledgeImageCompression handles one complete retry round.
+	ProcessKnowledgeImageCompression(ctx context.Context, t *asynq.Task) error
+	GetKnowledgeImageCompressionProgress(ctx context.Context, taskID string) (*types.KnowledgeImageCompressionProgress, error)
 	// GetKBCloneProgress retrieves the progress of a knowledge base clone task
 	GetKBCloneProgress(ctx context.Context, taskID string) (*types.KBCloneProgress, error)
 	// SaveKBCloneProgress saves the progress of a knowledge base clone task

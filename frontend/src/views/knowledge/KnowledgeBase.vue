@@ -1519,7 +1519,7 @@ const ensureDocumentKbReady = () => {
 };
 
 
-const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
+const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'svg'];
 const AUDIO_EXTENSIONS = ['mp3', 'wav', 'm4a', 'flac', 'ogg'];
 
 const uploadConfirmStore = useUploadConfirmStore();
@@ -1584,8 +1584,14 @@ const executeUploadBatch = async (
     return !!relativePath && relativePath.split('/').length > 2;
   });
 
-  for (const file of files) {
-    try {
+  const retryDelays = [1000, 3000, 10000];
+  let pending = [...files];
+  let lastSingleError: any = null;
+
+  for (let round = 0; round <= retryDelays.length && pending.length > 0; round++) {
+    const retryableFailures: File[] = [];
+    for (const file of pending) {
+      try {
       const uploadData: {
         file: File
         tag_ids?: string[]
@@ -1601,33 +1607,42 @@ const executeUploadBatch = async (
 
       const responseData: any = await uploadKnowledgeFile(targetKbId, uploadData);
       const isSuccess = responseData?.success || responseData?.code === 200 || responseData?.status === 'success' || (!responseData?.error && responseData);
-      if (isSuccess) {
-        successCount++;
-      } else {
-        failCount++;
-        if (totalCount === 1) {
-          let errorMessage = t('knowledgeBase.uploadFailed');
-          if (responseData?.error?.message) {
-            errorMessage = responseData.error.message;
-          } else if (responseData?.message) {
-            errorMessage = responseData.message;
+        const duplicate = responseData?.code === 'duplicate_file' || responseData?.error?.code === 'duplicate_file';
+        if (isSuccess || (round > 0 && duplicate)) {
+          successCount++;
+        } else {
+          lastSingleError = responseData;
+          if (round < retryDelays.length && isRetryableUploadFailure(responseData)) {
+            retryableFailures.push(file);
+          } else {
+            failCount++;
           }
-          if (responseData?.code === 'duplicate_file' || responseData?.error?.code === 'duplicate_file') {
-            errorMessage = t('knowledgeBase.fileExists');
-          }
-          MessagePlugin.error(errorMessage);
         }
-      }
-    } catch (error: any) {
-      failCount++;
-      if (totalCount === 1) {
-        let errorMessage = error?.error?.message || error?.message || t('knowledgeBase.uploadFailed');
-        if (error?.code === 'duplicate_file') {
-          errorMessage = t('knowledgeBase.fileExists');
+      } catch (error: any) {
+        lastSingleError = error;
+        const duplicate = error?.code === 'duplicate_file' || error?.error?.code === 'duplicate_file';
+        if (round > 0 && duplicate) {
+          successCount++;
+        } else if (round < retryDelays.length && isRetryableUploadFailure(error)) {
+          retryableFailures.push(file);
+        } else {
+          failCount++;
         }
-        MessagePlugin.error(errorMessage);
       }
     }
+
+    pending = retryableFailures;
+    if (pending.length > 0 && round < retryDelays.length) {
+      await new Promise((resolve) => window.setTimeout(resolve, retryDelays[round]));
+    }
+  }
+
+  if (totalCount === 1 && failCount > 0) {
+    let errorMessage = lastSingleError?.error?.message || lastSingleError?.message || t('knowledgeBase.uploadFailed');
+    if (lastSingleError?.code === 'duplicate_file' || lastSingleError?.error?.code === 'duplicate_file') {
+      errorMessage = t('knowledgeBase.fileExists');
+    }
+    MessagePlugin.error(errorMessage);
   }
 
   if (successCount > 0) {
@@ -1638,6 +1653,13 @@ const executeUploadBatch = async (
 
   showUploadResultMessages(successCount, failCount, totalCount, hasFolderPaths ? 'folder' : 'document');
   return { successCount, failCount };
+};
+
+const isRetryableUploadFailure = (error: any): boolean => {
+  const status = Number(error?.status || error?.response?.status || 0);
+  if (status === 408 || status === 425 || status === 429 || status >= 500) return true;
+  // The request helper emits no status for connection resets/timeouts.
+  return status === 0 && !error?.code && !error?.error?.code;
 };
 
 const executeUrlImport = async (url: string, processConfig?: KnowledgeProcessOverrides) => {

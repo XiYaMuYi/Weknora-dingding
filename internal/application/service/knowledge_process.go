@@ -2663,7 +2663,7 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 }
 
 // ProcessDocument handles Asynq document processing tasks
-func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) error {
+func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) (retErr error) {
 	var payload types.DocumentProcessPayload
 	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
 		logger.Errorf(ctx, "failed to unmarshal document process task payload: %v", err)
@@ -2747,6 +2747,21 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		return nil
+	}
+	if payload.DeleteSourceAfterProcess {
+		processingFileService := s.resolveFileServiceForPath(ctx, kb, payload.FilePath)
+		defer func() {
+			if !shouldDeleteTemporarySource(true, isLastRetry, retErr) {
+				return
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if deleteErr := processingFileService.DeleteFile(cleanupCtx, payload.FilePath); deleteErr != nil {
+				logger.Errorf(cleanupCtx, "failed to delete temporary processing source %s: %v", payload.FilePath, deleteErr)
+			} else {
+				logger.Infof(cleanupCtx, "deleted temporary processing source: %s", payload.FilePath)
+			}
+		}()
 	}
 
 	processOverrides, _ := knowledge.ProcessOverrides()
@@ -3074,6 +3089,13 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	s.processChunks(ctx, kb, knowledge, chunks, processOpts)
 
 	return nil
+}
+
+func shouldDeleteTemporarySource(temporary, finalAttempt bool, processErr error) bool {
+	// A successful document worker may only have enqueued later multimodal and
+	// post-processing tasks. Keep its original available for those asynchronous
+	// stages; OSS lifecycle removes it after the configured safety window.
+	return temporary && finalAttempt && processErr != nil
 }
 
 // convert handles both file and URL reading using a unified ReadRequest.
