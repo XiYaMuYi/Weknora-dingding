@@ -10,6 +10,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -262,6 +264,44 @@ func TestCanUseOversizedStaticProcessorDoesNotFlattenAnimatedWebP(t *testing.T) 
 	animated := []byte("RIFF\x10\x00\x00\x00WEBPANIM\x00\x00\x00\x00")
 	if canUseOversizedStaticProcessor("webp", animated) {
 		t.Fatal("animated WebP must not use the static image processor")
+	}
+}
+
+func TestCompressOversizedStaticInvokesVipsThumbnailSafely(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "expected.webp")
+	var encoded bytes.Buffer
+	if err := genwebp.Encode(&encoded, image.NewNRGBA(image.Rect(0, 0, 1920, 1200)), genwebp.Options{Quality: 75}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(output, encoded.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trace := filepath.Join(t.TempDir(), "vips-arguments")
+	binary := filepath.Join(t.TempDir(), "vips")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WEKNORA_VIPS_TEST_TRACE\"\nout=${3%%[*}\ncp \"$WEKNORA_VIPS_TEST_OUTPUT\" \"$out\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WEKNORA_VIPS_BINARY", binary)
+	t.Setenv("WEKNORA_VIPS_TEST_TRACE", trace)
+	t.Setenv("WEKNORA_VIPS_TEST_OUTPUT", output)
+
+	cfg := DefaultConfig()
+	got, err := compressOversizedStatic([]byte("not decoded by the fake processor"), "camera.jpg", cfg)
+	if err != nil {
+		t.Fatalf("compressOversizedStatic() error = %v", err)
+	}
+	if !bytes.Equal(got, encoded.Bytes()) {
+		t.Fatal("processor output was not returned")
+	}
+	arguments, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"thumbnail", "--height", "1920", "--size", "down", "[Q=75,effort=4]"} {
+		if !strings.Contains(string(arguments), expected) {
+			t.Fatalf("vips arguments missing %q: %s", expected, arguments)
+		}
 	}
 }
 
