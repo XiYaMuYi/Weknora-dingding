@@ -451,6 +451,29 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		return insertChunks[i].ChunkIndex < insertChunks[j].ChunkIndex
 	})
 
+	// For directly uploaded images, replace image URLs in chunks with the compressed file path
+	// This ensures chunks reference the compressed image instead of the temporary original
+	if IsImageType(knowledge.FileType) && knowledge.FilePath != "" {
+		// Build a map of original image URLs to the compressed file path
+		imageURLMap := make(map[string]string)
+		for _, img := range options.StoredImages {
+			// Map all stored image URLs to the compressed file path
+			if img.ServingURL != "" {
+				imageURLMap[img.ServingURL] = knowledge.FilePath
+			}
+		}
+
+		// Replace image URLs in chunk content
+		if len(imageURLMap) > 0 {
+			for _, chunk := range insertChunks {
+				for originalURL, compressedURL := range imageURLMap {
+					chunk.Content = strings.ReplaceAll(chunk.Content, originalURL, compressedURL)
+				}
+			}
+			logger.Infof(ctx, "Replaced image URLs in %d chunks with compressed file path for knowledge %s", len(insertChunks), knowledge.ID)
+		}
+	}
+
 	// 仅为文本类型的Chunk设置前后关系（child chunks only, parents already linked above）
 	textChunks := make([]*types.Chunk, 0, len(chunks))
 	for _, chunk := range insertChunks {
