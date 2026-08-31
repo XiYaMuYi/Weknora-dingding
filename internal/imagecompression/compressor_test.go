@@ -218,13 +218,50 @@ func TestCompressRejectsCorruptImage(t *testing.T) {
 	}
 }
 
-func TestCompressRejectsUnsafePixelCountBeforeFullDecode(t *testing.T) {
-	t.Parallel()
+func TestCompressDelegatesOversizedStaticImageToSafeDownsampler(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MinBytes = 0
-	_, err := Compress(pngWithDimensions(8000, 6000), "huge.png", cfg)
-	if err == nil || !IsPermanent(err) || !strings.Contains(err.Error(), "pixel") {
-		t.Fatalf("error = %v, want permanent pixel-limit error", err)
+	called := false
+	cfg.oversizedStaticProcessor = func(data []byte, fileName string, processorCfg Config) ([]byte, error) {
+		called = true
+		if fileName != "huge.png" || processorCfg.MaxWidth != 1920 || processorCfg.MaxHeight != 1920 {
+			t.Fatalf("unexpected downsampler arguments: file=%q cfg=%+v", fileName, processorCfg)
+		}
+		var output bytes.Buffer
+		if err := genwebp.Encode(&output, image.NewNRGBA(image.Rect(0, 0, 1920, 1440)), genwebp.Options{Quality: 75}); err != nil {
+			t.Fatal(err)
+		}
+		return output.Bytes(), nil
+	}
+
+	input := append(pngWithDimensions(8000, 6000), bytes.Repeat([]byte{0}, cfg.TargetBytes)...)
+	got, err := Compress(input, "huge.png", cfg)
+	if err != nil {
+		t.Fatalf("Compress() error = %v", err)
+	}
+	if !called || got.Format != "webp" || got.Width != 1920 || got.Height != 1440 || !got.Compressed {
+		t.Fatalf("oversized image was not safely downsampled: called=%v result=%+v", called, got)
+	}
+}
+
+func TestCompressPreservesRetryableOversizedProcessorFailure(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MinBytes = 0
+	cfg.oversizedStaticProcessor = func([]byte, string, Config) ([]byte, error) {
+		return nil, &RetryableError{Reason: "processor temporarily busy"}
+	}
+
+	input := append(pngWithDimensions(8000, 6000), bytes.Repeat([]byte{0}, cfg.TargetBytes)...)
+	_, err := Compress(input, "huge.png", cfg)
+	if err == nil || !IsRetryable(err) || IsPermanent(err) {
+		t.Fatalf("error = %v, want retryable processor error", err)
+	}
+}
+
+func TestCanUseOversizedStaticProcessorDoesNotFlattenAnimatedWebP(t *testing.T) {
+	animated := []byte("RIFF\x10\x00\x00\x00WEBPANIM\x00\x00\x00\x00")
+	if canUseOversizedStaticProcessor("webp", animated) {
+		t.Fatal("animated WebP must not use the static image processor")
 	}
 }
 

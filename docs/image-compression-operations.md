@@ -32,3 +32,17 @@ until the current round finishes and retried after 30 seconds, 2 minutes, and
 
 Existing chunks, OCR text, multimodal captions, embeddings, and RAG indexes
 are not regenerated.
+
+## High-pixel images
+
+Images larger than 40 megapixels do not enter the normal in-process decoder.
+Static JPG, PNG, BMP, TIFF, and non-animated WebP images are instead passed to
+the `libvips` thumbnailer, which shrinks them to the configured 1920px bound
+before WebP encoding. The production app image includes `libvips-tools` for
+this path. Only one oversized image is processed at a time and each attempt
+has a 90-second time limit.
+
+Animated GIF and animated WebP remain on the animation-preserving path and
+keep their separate total-frame-pixel safety limit. A timeout or processor
+runtime failure is retryable by historical migration; a missing processor is a
+deployment configuration error and is reported as permanent.

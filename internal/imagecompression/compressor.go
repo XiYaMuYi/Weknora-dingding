@@ -28,14 +28,15 @@ import (
 const AlgorithmVersion = "adaptive-webp-v1"
 
 type Config struct {
-	MinBytes           int
-	TargetBytes        int
-	MaxPixels          int64
-	MaxAnimationPixels int64
-	MaxWidth           int
-	MaxHeight          int
-	InitialQuality     int
-	MinQuality         int
+	MinBytes                 int
+	TargetBytes              int
+	MaxPixels                int64
+	MaxAnimationPixels       int64
+	MaxWidth                 int
+	MaxHeight                int
+	InitialQuality           int
+	MinQuality               int
+	oversizedStaticProcessor oversizedStaticProcessor
 }
 
 func DefaultConfig() Config {
@@ -87,6 +88,28 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &target)
 }
 
+// RetryableError marks a transient compressor failure. Historical migration
+// workers use it to defer the image to a later retry round instead of treating
+// an exhausted processor as a permanently invalid file.
+type RetryableError struct {
+	Reason string
+	Err    error
+}
+
+func (e *RetryableError) Error() string {
+	if e.Err == nil {
+		return e.Reason
+	}
+	return e.Reason + ": " + e.Err.Error()
+}
+
+func (e *RetryableError) Unwrap() error { return e.Err }
+
+func IsRetryable(err error) bool {
+	var target *RetryableError
+	return errors.As(err, &target)
+}
+
 func Compress(data []byte, fileName string, cfg Config) (Result, error) {
 	cfg = normalizeConfig(cfg)
 	base := Result{
@@ -121,8 +144,8 @@ func Compress(data []byte, fileName string, cfg Config) (Result, error) {
 	base.ContentType = contentType(base.Format)
 	base.FileName = replaceExtension(fileName, base.Format)
 	base.Width, base.Height = decodedCfg.Width, decodedCfg.Height
-	if decodedCfg.Width <= 0 || decodedCfg.Height <= 0 ||
-		int64(decodedCfg.Width)*int64(decodedCfg.Height) > cfg.MaxPixels {
+	pixels := int64(decodedCfg.Width) * int64(decodedCfg.Height)
+	if decodedCfg.Width <= 0 || decodedCfg.Height <= 0 {
 		return Result{}, &PermanentError{Reason: fmt.Sprintf("image pixel count exceeds limit (%d)", cfg.MaxPixels)}
 	}
 	if len(data) < cfg.MinBytes {
@@ -131,18 +154,23 @@ func Compress(data []byte, fileName string, cfg Config) (Result, error) {
 
 	var output []byte
 	var outputFormat string
-	switch base.Format {
-	case "gif":
+	switch {
+	case pixels > cfg.MaxPixels && canUseOversizedStaticProcessor(base.Format, data):
+		output, err = cfg.oversizedStaticProcessor(data, fileName, cfg)
+		outputFormat = "webp"
+	case pixels > cfg.MaxPixels:
+		return Result{}, &PermanentError{Reason: fmt.Sprintf("image pixel count exceeds limit (%d)", cfg.MaxPixels)}
+	case base.Format == "gif":
 		output, err = compressGIF(data, cfg)
 		outputFormat = "gif"
-	case "webp":
+	case base.Format == "webp":
 		output, outputFormat, err = compressWebP(data, cfg)
 	default:
 		output, err = compressStatic(data, cfg)
 		outputFormat = "webp"
 	}
 	if err != nil {
-		if IsPermanent(err) {
+		if IsPermanent(err) || IsRetryable(err) {
 			return Result{}, err
 		}
 		return Result{}, &PermanentError{Reason: "image compression failed", Err: err}
@@ -343,6 +371,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.MinQuality <= 0 || cfg.MinQuality > cfg.InitialQuality {
 		cfg.MinQuality = defaults.MinQuality
+	}
+	if cfg.oversizedStaticProcessor == nil {
+		cfg.oversizedStaticProcessor = compressOversizedStatic
 	}
 	return cfg
 }

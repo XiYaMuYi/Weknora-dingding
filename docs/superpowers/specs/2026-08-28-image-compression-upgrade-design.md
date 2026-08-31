@@ -21,7 +21,7 @@ Not in scope: images embedded inside PDFs/Office files, arbitrary objects found 
 - Static raster output uses WebP, preserving alpha. Quality starts at 75 and may fall to 60; resolution may step down to 1600, 1280, 1024, then 960 pixels on the longest side.
 - Animated GIF/WebP preserves animation and uses adaptive resizing/encoding where supported.
 - SVG remains SVG, is validated as an image, and must already be at or below 1 MiB.
-- Decode configuration is checked before full decode. Images over 40 megapixels are rejected as unsafe.
+- Decode configuration is checked before full decode. Static JPG, PNG, BMP, TIFF, and non-animated WebP images over 40 megapixels are sent to the single-concurrency, 90-second `libvips` shrink-on-load path before WebP encoding; unsupported animated inputs keep their separate animation safety limit.
 - A valid raster image that cannot meet 1 MiB at the quality/resolution floor is classified as a permanent compression failure. Transient storage/runtime failures are retryable.
 - Output filename extension, MIME type, size, and stored bytes always agree.
 
@@ -50,7 +50,7 @@ If saving either object or persisting the knowledge record fails, delete every o
 
 ## Retry Policy
 
-- Compression inability, corrupt image data, unsafe pixel count, and unsupported oversized SVG are permanent failures.
+- Compression inability, corrupt image data, unsupported oversized SVG, missing oversized-image processor, and unsupported unsafe animation input are permanent failures. Oversized-image processor timeouts and runtime failures are retryable.
 - Network timeouts and object-storage read/write/delete failures are transient.
 - A round processes every pending item once. Retryable failures are held until the round finishes, then retried as a group after 30 seconds, 2 minutes, and 10 minutes. Three retry rounds are allowed after the initial attempt.
 
