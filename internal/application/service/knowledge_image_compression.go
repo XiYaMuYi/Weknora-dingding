@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	werrors "github.com/Tencent/WeKnora/internal/errors"
@@ -366,6 +367,10 @@ func (s *knowledgeService) compressExistingKnowledgeImage(ctx context.Context, k
 	if err := s.repo.UpdateKnowledgeColumns(ctx, knowledge.ID, map[string]interface{}{"compression_info": types.JSON(infoData)}); err != nil {
 		logger.Warnf(ctx, "compressed image %s but failed to finalize compression metadata: %v", knowledge.ID, err)
 	}
+	// Update chunks table to reference the new compressed image path
+	if err := s.updateChunksImagePath(ctx, knowledge.ID, knowledge.FilePath, newPath); err != nil {
+		logger.Warnf(ctx, "compressed image %s but failed to update chunks: %v", knowledge.ID, err)
+	}
 	return result.OriginalSize, result.CompressedSize, false, nil
 }
 
@@ -469,4 +474,31 @@ func (s *knowledgeService) releaseKnowledgeImageCompressionLock(ctx context.Cont
 	if err := s.redisClient.Eval(ctx, script, []string{knowledgeImageCompressionLockPrefix + kbID}, taskID).Err(); err != nil {
 		logger.Warnf(ctx, "failed to release image compression lock for KB %s: %v", kbID, err)
 	}
+}
+
+// updateChunksImagePath updates all chunks of a knowledge item to replace the old image path with the new one
+func (s *knowledgeService) updateChunksImagePath(ctx context.Context, knowledgeID, oldPath, newPath string) error {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	chunks, err := s.chunkRepo.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return fmt.Errorf("list chunks for knowledge %s: %w", knowledgeID, err)
+	}
+
+	// Find chunks that reference the old path and update them
+	var chunksToUpdate []*types.Chunk
+	for _, chunk := range chunks {
+		if chunk.Content != "" && strings.Contains(chunk.Content, oldPath) {
+			chunk.Content = strings.ReplaceAll(chunk.Content, oldPath, newPath)
+			chunksToUpdate = append(chunksToUpdate, chunk)
+		}
+	}
+
+	if len(chunksToUpdate) > 0 {
+		if err := s.chunkRepo.UpdateChunks(ctx, chunksToUpdate); err != nil {
+			return fmt.Errorf("update chunks for knowledge %s: %w", knowledgeID, err)
+		}
+		logger.Infof(ctx, "updated %d chunks for knowledge %s to reference new image path", len(chunksToUpdate), knowledgeID)
+	}
+
+	return nil
 }
