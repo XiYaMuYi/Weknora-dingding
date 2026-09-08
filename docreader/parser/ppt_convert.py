@@ -114,3 +114,104 @@ def normalize_ppt_bytes(content: bytes, file_type: str | None) -> tuple[bytes, s
         "LibreOffice is required to convert it to .pptx. Install LibreOffice "
         "(soffice) in the docreader environment or upload .pptx instead."
     )
+
+
+def convert_ppt_to_pdf_bytes(content: bytes, suffix: str = ".pptx") -> bytes | None:
+    """Convert PowerPoint bytes (ppt or pptx) to PDF using LibreOffice, if available."""
+    soffice = find_soffice()
+    if not soffice:
+        logger.warning("LibreOffice not found, cannot convert PPT to PDF")
+        return None
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as profile_dir:
+            src = os.path.join(temp_dir, f"input{suffix}")
+            with open(src, "wb") as handle:
+                handle.write(content)
+
+            user_installation = Path(profile_dir).as_uri()
+            cmd = [
+                soffice,
+                "--headless",
+                f"-env:UserInstallation={user_installation}",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temp_dir,
+                src,
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=180)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("LibreOffice PPT to PDF convert failed to start: %s", exc)
+                return None
+
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="ignore")
+                logger.warning(
+                    "LibreOffice PPT to PDF convert failed (attempt %s/%s): %s",
+                    attempt,
+                    max_attempts,
+                    stderr,
+                )
+                if attempt < max_attempts:
+                    time.sleep(0.5 * attempt)
+                    continue
+                return None
+
+            for name in os.listdir(temp_dir):
+                if name.endswith(".pdf"):
+                    with open(os.path.join(temp_dir, name), "rb") as handle:
+                        converted = handle.read()
+                    logger.info(
+                        "Converted presentation to PDF via LibreOffice (%s -> pdf, %d bytes)",
+                        suffix,
+                        len(converted),
+                    )
+                    return converted
+
+            if attempt < max_attempts:
+                time.sleep(0.5 * attempt)
+    return None
+
+
+def normalize_ppt_to_pdf_bytes(content: bytes, file_type: str | None) -> tuple[bytes, str]:
+    """Convert any PowerPoint format to PDF for content extraction.
+    
+    Returns (bytes, extension) where extension is always '.pdf'.
+    This ensures consistent PDF-based parsing for all PPT files.
+    """
+    ext = (file_type or "").lstrip(".").lower()
+    
+    # First normalize to pptx if it's legacy .ppt
+    if needs_ppt_to_pptx_conversion(content, ext):
+        suffix = ".ppt" if ext in ("", "ppt") else f".{ext}"
+        pptx_content = convert_ppt_to_pptx_bytes(content, suffix=suffix)
+        if pptx_content:
+            content = pptx_content
+            ext = "pptx"
+        else:
+            raise ValueError(
+                "Legacy PowerPoint (.ppt) conversion failed. "
+                "LibreOffice is required. Install LibreOffice (soffice) in the docreader environment."
+            )
+    
+    # Now convert pptx to pdf
+    if ext in ("ppt", "pptx") or is_zip_openxml(content):
+        suffix = f".{ext}" if ext in ("ppt", "pptx") else ".pptx"
+        pdf_content = convert_ppt_to_pdf_bytes(content, suffix=suffix)
+        if pdf_content:
+            return pdf_content, ".pdf"
+        else:
+            # Fallback: if PDF conversion fails, return original pptx
+            logger.warning("PPT to PDF conversion failed, falling back to pptx parsing")
+            if is_zip_openxml(content):
+                return content, ".pptx"
+            raise ValueError(
+                "PowerPoint to PDF conversion failed. LibreOffice may not be available or the file is corrupted."
+            )
+    
+    # Not a PPT file, return as-is
+    dotted = f".{ext}" if ext else ""
+    return content, dotted

@@ -9,7 +9,7 @@ from docreader.parser.base_parser import BaseParser
 from docreader.parser.chain_parser import PipelineParser
 from docreader.parser.concurrency import parser_worker_limit
 from docreader.parser.markdown_parser import MarkdownParser
-from docreader.parser.ppt_convert import normalize_ppt_bytes
+from docreader.parser.ppt_convert import normalize_ppt_bytes, normalize_ppt_to_pdf_bytes
 from docreader.parser.pptx_media import (
     attach_pptx_media_to_markdown,
     markdown_needs_pptx_media_attach,
@@ -35,14 +35,25 @@ class StdMarkitdownParser(BaseParser):
         """
         Parses content using MarkItDown.
         Uses self.file_type (inherited from BaseParser) to hint the stream format.
+        
+        For PowerPoint files (ppt/pptx), converts to PDF first for better content extraction.
         """
         ext = self.file_type
         ft = (ext or "").lstrip(".").lower()
         pptx_bytes: bytes | None = None
+        
+        # Convert PPT to PDF for consistent parsing
         if ft in ("ppt", "pptx"):
-            content, ext = normalize_ppt_bytes(content, ft)
-            pptx_bytes = content
-            ft = "pptx"
+            try:
+                content, ext = normalize_ppt_to_pdf_bytes(content, ft)
+                ft = "pdf"
+                logger.info("Converted PPT to PDF for parsing, new extension: %s", ext)
+            except Exception as e:
+                logger.warning("PPT to PDF conversion failed: %s, falling back to pptx parsing", e)
+                # Fallback to original pptx parsing
+                content, ext = normalize_ppt_bytes(content, ft)
+                pptx_bytes = content
+                ft = "pptx"
         elif ext and not ext.startswith("."):
             ext = "." + ext
 
