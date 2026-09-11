@@ -231,7 +231,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterDataSourceRoutes(v1, params.DataSourceHandler, params.DataSourceCredentialsHandler, rbacGuards)
 		RegisterWeKnoraCloudRoutes(v1, params.WeKnoraCloudHandler, rbacGuards)
 		RegisterWikiPageRoutes(v1, params.WikiPageHandler, rbacGuards)
-		RegisterKnowledgeMediaRoutes(v1, params.KnowledgeMediaHandler)
+		RegisterKnowledgeMediaRoutes(v1, params.KnowledgeMediaHandler, rbacGuards)
 		RegisterChunkerDebugRoutes(v1, rbacGuards)
 	}
 
@@ -1819,7 +1819,13 @@ func RegisterWikiPageRoutes(r *gin.RouterGroup, wikiHandler *handler.WikiPageHan
 //
 // Both routes use API key authentication (X-API-Key header) and tenant validation.
 // No RBAC guards needed as these are read-only operations scoped to the tenant's own data.
-func RegisterKnowledgeMediaRoutes(r *gin.RouterGroup, handler *handler.KnowledgeMediaHandler) {
+func RegisterKnowledgeMediaRoutes(r *gin.RouterGroup, handler *handler.KnowledgeMediaHandler, g *rbacGuards) {
+	// Resolve is KB-scoped so the existing shared-KB read guard can set the
+	// resource owner's effective tenant before the handler loads image chunks.
+	kb := r.Group("/knowledge-bases/:id/knowledge-media")
+	{
+		kb.POST("/resolve", g.Viewer(), g.KBAccessRead("id"), handler.Resolve)
+	}
 	media := r.Group("/knowledge-media")
 	{
 		// Resolve knowledge_id + chunk_id pairs to short-lived media_ids
