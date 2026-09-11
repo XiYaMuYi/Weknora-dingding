@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
 )
@@ -49,15 +50,9 @@ func (h *KnowledgeMediaHandler) Resolve(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// Get tenant ID from context (set by API key middleware)
-	tenantID, exists := c.Get("tenant_id")
+	tenantID, exists := types.TenantIDFromContext(ctx)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant not found"})
-		return
-	}
-
-	tenantIDUint, ok := tenantID.(uint64)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant_id"})
 		return
 	}
 
@@ -80,7 +75,7 @@ func (h *KnowledgeMediaHandler) Resolve(c *gin.Context) {
 	}
 
 	// Resolve media
-	resolved, err := h.service.Resolve(ctx, tenantIDUint, req.Items)
+	resolved, err := h.service.Resolve(ctx, tenantID, req.Items)
 	if err != nil {
 		logger.Errorf(ctx, "[KnowledgeMedia] Failed to resolve media: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve media"})
@@ -112,15 +107,9 @@ func (h *KnowledgeMediaHandler) Fetch(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// Get tenant ID from context
-	tenantID, exists := c.Get("tenant_id")
+	tenantID, exists := types.TenantIDFromContext(ctx)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant not found"})
-		return
-	}
-
-	tenantIDUint, ok := tenantID.(uint64)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant_id"})
 		return
 	}
 
@@ -132,7 +121,7 @@ func (h *KnowledgeMediaHandler) Fetch(c *gin.Context) {
 	}
 
 	// Fetch image
-	data, contentType, err := h.service.Fetch(ctx, tenantIDUint, mediaID)
+	data, contentType, err := h.service.Fetch(ctx, tenantID, mediaID)
 	if err != nil {
 		logger.Warnf(ctx, "[KnowledgeMedia] Failed to fetch media %s: %v", mediaID, err)
 		// Return 404 for all errors to avoid leaking information
