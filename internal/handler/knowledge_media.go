@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/middleware"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
@@ -75,7 +76,22 @@ func (h *KnowledgeMediaHandler) Resolve(c *gin.Context) {
 	}
 
 	// Resolve media
-	resolved, err := h.service.Resolve(ctx, tenantID, req.Items)
+	var resolved []interfaces.ResolvedMedia
+	var err error
+	// KBAccessRead rewrites the request context to the resource owner's tenant
+	// for shared KB reads, but keeps the authenticated caller in gin.Context.
+	// Bind the generated handle to that caller so its subsequent GET succeeds
+	// without granting it access to unrelated owner resources.
+	if _, sharedRoute := middleware.KBAccessFromContext(c); sharedRoute {
+		if caller, ok := c.Get(types.TenantIDContextKey.String()); ok {
+			if callerTenantID, ok := caller.(uint64); ok && callerTenantID != 0 {
+				resolved, err = h.service.ResolveForAccess(ctx, tenantID, callerTenantID, req.Items)
+			}
+		}
+	}
+	if resolved == nil && err == nil {
+		resolved, err = h.service.Resolve(ctx, tenantID, req.Items)
+	}
 	if err != nil {
 		logger.Errorf(ctx, "[KnowledgeMedia] Failed to resolve media: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve media"})

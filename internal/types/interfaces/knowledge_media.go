@@ -11,6 +11,11 @@ type KnowledgeMediaService interface {
 	// Returns a list of resolved media items with short-lived media_ids
 	Resolve(ctx context.Context, tenantID uint64, items []MediaResolveItem) ([]ResolvedMedia, error)
 
+	// ResolveForAccess resolves chunks belonging to resourceTenantID, while
+	// binding the short-lived media handles to accessTenantID. Callers must
+	// verify the requester's KB permission before invoking this method.
+	ResolveForAccess(ctx context.Context, resourceTenantID, accessTenantID uint64, items []MediaResolveItem) ([]ResolvedMedia, error)
+
 	// Fetch retrieves image bytes by media_id
 	// Returns image data, content type, and error
 	Fetch(ctx context.Context, tenantID uint64, mediaID string) ([]byte, string, error)

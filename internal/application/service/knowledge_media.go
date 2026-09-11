@@ -71,15 +71,24 @@ func NewKnowledgeMediaService(
 	}
 }
 
-
-
 // Resolve resolves knowledge_id + chunk_id pairs to media_ids
 func (s *knowledgeMediaService) Resolve(ctx context.Context, tenantID uint64, items []interfaces.MediaResolveItem) ([]interfaces.ResolvedMedia, error) {
+	return s.resolve(ctx, tenantID, tenantID, items)
+}
+
+// ResolveForAccess is for a previously-authorized shared knowledge base.
+// It deliberately reads chunks using the resource owner's tenant but creates
+// handles consumable only by the tenant that was granted access.
+func (s *knowledgeMediaService) ResolveForAccess(ctx context.Context, resourceTenantID, accessTenantID uint64, items []interfaces.MediaResolveItem) ([]interfaces.ResolvedMedia, error) {
+	return s.resolve(ctx, resourceTenantID, accessTenantID, items)
+}
+
+func (s *knowledgeMediaService) resolve(ctx context.Context, resourceTenantID, accessTenantID uint64, items []interfaces.MediaResolveItem) ([]interfaces.ResolvedMedia, error) {
 	result := make([]interfaces.ResolvedMedia, 0, len(items)*maxImagesPerChunk)
 
 	for _, item := range items {
 		// Get chunk with tenant validation
-		chunk, err := s.chunkRepo.GetChunkByID(ctx, tenantID, item.ChunkID)
+		chunk, err := s.chunkRepo.GetChunkByID(ctx, resourceTenantID, item.ChunkID)
 		if err != nil {
 			logger.Warnf(ctx, "[KnowledgeMedia] Failed to get chunk %s: %v", item.ChunkID, err)
 			continue
@@ -121,7 +130,7 @@ func (s *knowledgeMediaService) Resolve(ctx context.Context, tenantID uint64, it
 			}
 
 			// Generate media_id
-			mediaID, err := s.generateMediaID(ctx, tenantID, img.URL, contentType)
+			mediaID, err := s.generateMediaID(ctx, accessTenantID, img.URL, contentType)
 			if err != nil {
 				logger.Errorf(ctx, "[KnowledgeMedia] Failed to generate media_id: %v", err)
 				continue
