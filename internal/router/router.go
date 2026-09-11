@@ -86,6 +86,7 @@ type RouterParams struct {
 	DataSourceCredentialsHandler *handler.DataSourceCredentialsHandler
 	WeKnoraCloudHandler          *handler.WeKnoraCloudHandler
 	WikiPageHandler              *handler.WikiPageHandler
+	KnowledgeMediaHandler        *handler.KnowledgeMediaHandler
 }
 
 // NewRouter 创建新的路由
@@ -230,6 +231,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterDataSourceRoutes(v1, params.DataSourceHandler, params.DataSourceCredentialsHandler, rbacGuards)
 		RegisterWeKnoraCloudRoutes(v1, params.WeKnoraCloudHandler, rbacGuards)
 		RegisterWikiPageRoutes(v1, params.WikiPageHandler, rbacGuards)
+		RegisterKnowledgeMediaRoutes(v1, params.KnowledgeMediaHandler)
 		RegisterChunkerDebugRoutes(v1, rbacGuards)
 	}
 
@@ -1805,5 +1807,25 @@ func RegisterWikiPageRoutes(r *gin.RouterGroup, wikiHandler *handler.WikiPageHan
 		// Issues
 		wiki.GET("/issues", g.Viewer(), wikiHandler.ListIssues)
 		wiki.PUT("/issues/:issue_id/status", g.OwnedWikiKBOrAdmin(), wikiHandler.UpdateIssueStatus)
+	}
+}
+
+// RegisterKnowledgeMediaRoutes registers knowledge media resolution routes.
+// These routes provide short-lived media_ids for accessing knowledge base images
+// without exposing OSS paths or credentials.
+//
+// POST /knowledge-media/resolve - Resolve chunk_id + knowledge_id to media_ids
+// GET /knowledge-media/:media_id - Fetch image by media_id
+//
+// Both routes use API key authentication (X-API-Key header) and tenant validation.
+// No RBAC guards needed as these are read-only operations scoped to the tenant's own data.
+func RegisterKnowledgeMediaRoutes(r *gin.RouterGroup, handler *handler.KnowledgeMediaHandler) {
+	media := r.Group("/knowledge-media")
+	{
+		// Resolve knowledge_id + chunk_id pairs to short-lived media_ids
+		media.POST("/resolve", handler.Resolve)
+
+		// Fetch image by media_id
+		media.GET("/:media_id", handler.Fetch)
 	}
 }
