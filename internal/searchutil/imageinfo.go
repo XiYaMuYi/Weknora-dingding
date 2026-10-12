@@ -40,6 +40,19 @@ var HTMLImageSrcRegex = regexp.MustCompile(`(?i)<img\b([^>]*?)\ssrc\s*=\s*['"]([
 // HTMLImageSrcRegex.
 const HTMLImageSrcURLGroup = 2
 
+
+
+// CollectImageInfoForKnowledge collects image info for a specific knowledge item.
+func CollectImageInfoForKnowledge(ctx context.Context, chunkRepo interfaces.ChunkRepository,
+	tenantID uint64, knowledgeID string, chunkIDs []string) map[string]string {
+	if knowledgeID == "" {
+		return nil
+	}
+	return collectImageInfoByChunkIDs(chunkIDs, func(parentIDs []string) ([]*types.Chunk, error) {
+		return chunkRepo.ListChunksByParentIDs(ctx, tenantID, parentIDs)
+	})
+}
+
 // CollectImageInfoByChunkIDs collects merged image_info JSON for each given
 // chunk ID by querying child chunks (image_ocr / image_caption). It supports
 // two-level resolution:

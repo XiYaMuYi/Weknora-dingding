@@ -82,7 +82,7 @@ var queueDefinitions = []QueueDefinition{
 	{Name: QueueSync, Pool: WorkerPoolMaintenance, Weight: 2, TaskTypes: []string{TypeDataSourceSync}},
 	{Name: QueueMaintenance, Pool: WorkerPoolMaintenance, Weight: 1, TaskTypes: []string{
 		TypeFAQImport, TypeKBClone, TypeIndexDelete, TypeKBDelete,
-		TypeKnowledgeListDelete, TypeKnowledgeListReparse, TypeKnowledgeMove,
+		TypeKnowledgeListDelete, TypeKnowledgeListReparse, TypeKnowledgeMove, TypeKnowledgeImageCompress,
 	}},
 	{Name: QueueWiki, Pool: WorkerPoolWiki, Weight: 1, TaskTypes: []string{TypeWikiIngest, TypeWikiFinalize}},
 }
@@ -252,6 +252,7 @@ const (
 	TypeDataSourceSync           = "datasource:sync"            // 数据源同步任务
 	TypeWikiIngest               = "wiki:ingest"                // Wiki 页面同步任务
 	TypeWikiFinalize             = "wiki:finalize"              // Wiki KB 级收尾任务（防抖：索引重建/死链清理/交叉链接）
+	TypeKnowledgeImageCompress = "knowledge:image_compress" // 存量知识图片压缩任务
 	TypeTemporaryDocumentProcess = "temporary_document:process" // 会话临时文档解析任务
 	// TypeMemoryExtract 长期记忆抽取任务（会话轮次防抖后异步执行）
 	TypeMemoryExtract = "memory:extract"
@@ -276,6 +277,47 @@ type MemoryExtractPayload struct {
 	// is what the settings UI promises.
 	ChatModelID string `json:"chat_model_id,omitempty"`
 	Language    string `json:"language,omitempty"`
+}
+
+
+// KnowledgeImageCompressionPayload is one complete batch round.
+type KnowledgeImageCompressionPayload struct {
+	TenantID     uint64   `json:"tenant_id"`
+	TaskID       string   `json:"task_id"`
+	KBID         string   `json:"kb_id"`
+	KnowledgeIDs []string `json:"knowledge_ids"`
+	RetryRound   int      `json:"retry_round"`
+}
+
+type KnowledgeImageCompressionPreview struct {
+	KBID             string `json:"kb_id"`
+	EligibleImages   int    `json:"eligible_images"`
+	TotalSourceBytes int64  `json:"total_source_bytes"`
+	TargetBytes      int64  `json:"target_bytes"`
+}
+
+type KnowledgeImageCompressionProgress struct {
+	TaskID             string            `json:"task_id"`
+	KBID               string            `json:"kb_id"`
+	Status             KBCloneTaskStatus `json:"status"`
+	Total              int               `json:"total"`
+	Processed          int               `json:"processed"`
+	BatchesRemaining   int               `json:"batches_remaining"`
+	ActiveBatches      int               `json:"active_batches"`
+	Succeeded          int               `json:"succeeded"`
+	Skipped            int               `json:"skipped"`
+	PermanentFailed    int               `json:"permanent_failed"`
+	Failed             int               `json:"failed"`
+	Retrying           int               `json:"retrying"`
+	RetryRound         int               `json:"retry_round"`
+	BytesBefore        int64             `json:"bytes_before"`
+	BytesAfter         int64             `json:"bytes_after"`
+	SavedBytes         int64             `json:"saved_bytes"`
+	FailedKnowledgeIDs []string          `json:"failed_knowledge_ids,omitempty"`
+	Errors             map[string]string `json:"errors,omitempty"`
+	Message            string            `json:"message"`
+	CreatedAt          int64             `json:"created_at"`
+	UpdatedAt          int64             `json:"updated_at"`
 }
 
 // ExtractChunkPayload represents the extract chunk task payload

@@ -375,19 +375,6 @@ func mergeExtractedIdentity(dst, src extractedItem) extractedItem {
 	return dst
 }
 
-func appendUniqueString(values []string, value string) []string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return values
-	}
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
-	}
-	return append(values, value)
-}
-
 // stabilizeExtractedIdentities applies deterministic existing-page resolutions,
 // cross-batch identity claims, and same-result coalescing. mergeTargets maps
 // an extracted slug to a semantic/LLM merge destination and is not

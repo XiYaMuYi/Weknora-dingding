@@ -54,6 +54,9 @@ type knowledgeService struct {
 	repo            interfaces.KnowledgeRepository
 	kbService       interfaces.KnowledgeBaseService
 	tenantRepo      interfaces.TenantRepository
+	memImageCompressionProgress sync.Map // taskID -> *types.KnowledgeImageCompressionProgress
+	memImageCompressionRunning  sync.Map // kbID -> taskID
+	imageCompressionMu          sync.Mutex
 	tenantService   interfaces.TenantService
 	documentReader  interfaces.DocumentReader
 	chunkService    interfaces.ChunkService
@@ -98,7 +101,7 @@ func NewKnowledgeService(
 	repo interfaces.KnowledgeRepository,
 	documentReader interfaces.DocumentReader,
 	kbService interfaces.KnowledgeBaseService,
-	tenantRepo interfaces.TenantRepository,
+	tenantRepo      interfaces.TenantRepository,
 	tenantService interfaces.TenantService,
 	chunkService interfaces.ChunkService,
 	chunkRepo interfaces.ChunkRepository,

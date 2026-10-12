@@ -44,6 +44,8 @@ type RouterParams struct {
 	AgentShareService            interfaces.AgentShareService
 	KBHandler                    *handler.KnowledgeBaseHandler
 	KnowledgeHandler             *handler.KnowledgeHandler
+	KnowledgeMediaHandler        *handler.KnowledgeMediaHandler
+	ProductKnowledgeHandler      *handler.ProductKnowledgeHandler
 	TenantHandler                *handler.TenantHandler
 	TenantService                interfaces.TenantService
 	TenantAPIKeyService          interfaces.TenantAPIKeyService
@@ -294,6 +296,8 @@ func NewRouter(params RouterParams) *gin.Engine {
 		)
 		RegisterKnowledgeTagRoutes(v1, params.TagHandler, rbacGuards)
 		RegisterKnowledgeRoutes(v1, params.KnowledgeHandler, rbacGuards)
+		RegisterKnowledgeMediaRoutes(v1, params.KnowledgeMediaHandler, rbacGuards)
+		RegisterProductKnowledgeRoutes(v1, params.ProductKnowledgeHandler, rbacGuards)
 		RegisterFAQRoutes(v1, params.FAQHandler, rbacGuards)
 		RegisterChunkRoutes(v1, params.ChunkHandler, rbacGuards)
 		RegisterSessionRoutes(v1, params.SessionHandler, params.MessageSuggestionHandler, rbacGuards)
@@ -363,3 +367,35 @@ func trustedProxies() []string {
 	}
 	return proxies
 }
+
+
+// RegisterKnowledgeMediaRoutes registers knowledge media resolution routes.
+func RegisterKnowledgeMediaRoutes(r *gin.RouterGroup, handler *handler.KnowledgeMediaHandler, g *rbacGuards) {
+	// Resolve is KB-scoped so the existing shared-KB read guard can set the
+	// resource owner's effective tenant before the handler loads image chunks.
+	kb := r.Group("/knowledge-bases/:id/knowledge-media")
+	{
+		kb.POST("/resolve", g.Viewer(), g.KBAccessRead("id"), handler.Resolve)
+	}
+	media := r.Group("/knowledge-media")
+	{
+		// Resolve knowledge_id + chunk_id pairs to short-lived media_ids
+		media.POST("/resolve", handler.Resolve)
+
+		// Fetch image by media_id
+		media.GET("/:media_id", handler.Fetch)
+	}
+}
+
+func RegisterProductKnowledgeRoutes(r *gin.RouterGroup, h *handler.ProductKnowledgeHandler, g *rbacGuards) {
+	if h == nil {
+		return
+	}
+	kb := r.Group("/knowledge-bases/:id/product-knowledge")
+	kb.GET("", g.Viewer(), g.KBAccessRead("id"), h.Get)
+	kb.POST("/query", g.Viewer(), g.KBAccessRead("id"), h.Query)
+	kb.PUT("", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), h.Put)
+	kb.POST("/entities", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), h.CreateEntity)
+	kb.POST("/candidates", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), h.IngestCandidates)
+}
+

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/imagecompression"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -542,4 +544,28 @@ func downloadFileFromURL(ctx context.Context, fileURL string, payloadFileName, p
 	}
 
 	return contentBytes, nil
+}
+
+func buildImageCompressionInfo(result imagecompression.Result, source string) types.JSON {
+	info := map[string]interface{}{
+		"status":            "completed",
+		"source":            source,
+		"compressed":        result.Compressed,
+		"original_size":     result.OriginalSize,
+		"stored_size":       result.CompressedSize,
+		"original_hash":     result.OriginalHash,
+		"original_format":   result.OriginalFormat,
+		"stored_hash":       result.StoredHash,
+		"stored_format":     result.Format,
+		"width":             result.Width,
+		"height":            result.Height,
+		"compression_ratio": result.CompressionRatio,
+		"algorithm_version": result.AlgorithmVersion,
+		"compressed_at":     time.Now().UTC(),
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return nil
+	}
+	return types.JSON(data)
 }

@@ -40,10 +40,11 @@ services:
       dockerfile: docker/Dockerfile.app
       args:
         - APK_MIRROR_ARG=${APK_MIRROR_ARG:-}
-        - WITH_ANYDOC=${WITH_ANYDOC:-1}
+        - GOPROXY_ARG=${GOPROXY_ARG:-https://goproxy.cn,direct}
+        - WITH_ANYDOC=${WITH_ANYDOC:-0}
     container_name: WeKnora-app
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${APP_PORT:-8080}:${SERVER_PORT:-8080}"
     volumes:
       - data-files:/data/files
       - docreader-tmp:/tmp/docreader:ro
@@ -60,7 +61,7 @@ services:
       # Copy config/models.json.example to config/models.json, then
       # - ./config/models.json:/app/config/models.json:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3
