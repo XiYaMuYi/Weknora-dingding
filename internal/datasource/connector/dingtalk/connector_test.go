@@ -1,1388 +1,1787 @@
 package dingtalk
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/Tencent/WeKnora/internal/datasource"
-	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-type fakeAPI struct {
-	workspaces   []workspace
-	nodes        map[string][]node
-	blocks       map[string][]json.RawMessage
-	downloads    map[string][]byte
-	nodeErrors   map[string]error
-	blockErrors  map[string]error
-	verifyErrors map[string]error
-	dlErrors     map[string]error
-	blockCalls   map[string]int
-	verifyCalls  map[string]int
-	dlCalls      map[string]int
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
-func (f *fakeAPI) listWorkspaces(context.Context) ([]workspace, error) {
-	return f.workspaces, nil
-}
-
-func (f *fakeAPI) listNodes(_ context.Context, parentID string) ([]node, error) {
-	if err := f.nodeErrors[parentID]; err != nil {
-		return nil, err
+func testDOCXBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range map[string]string{
+		"[Content_Types].xml": `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`,
+		"word/document.xml":   `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>`,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(w, content); err != nil {
+			t.Fatal(err)
+		}
 	}
-	return f.nodes[parentID], nil
-}
-
-// listNodesPage serves every child of parentID as a single page.
-func (f *fakeAPI) listNodesPage(ctx context.Context, parentID, _ string) ([]node, string, error) {
-	nodes, err := f.listNodes(ctx, parentID)
-	return nodes, "", err
-}
-
-func (f *fakeAPI) documentBlocks(_ context.Context, documentID string) ([]json.RawMessage, error) {
-	if f.blockCalls == nil {
-		f.blockCalls = make(map[string]int)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
 	}
-	f.blockCalls[documentID]++
-	if err := f.blockErrors[documentID]; err != nil {
-		return nil, err
-	}
-	return f.blocks[documentID], nil
+	return buf.Bytes()
 }
 
-func (f *fakeAPI) verifyDocumentDownload(_ context.Context, documentID string) error {
-	if f.verifyCalls == nil {
-		f.verifyCalls = make(map[string]int)
+func zipBytesContainingOnly(t *testing.T, name, content string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create(name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	f.verifyCalls[documentID]++
-	return f.verifyErrors[documentID]
+	if _, err := io.WriteString(w, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
-func (f *fakeAPI) downloadDocument(_ context.Context, documentID string) ([]byte, error) {
-	if f.dlCalls == nil {
-		f.dlCalls = make(map[string]int)
+func TestValidateDOCX_rejectsInvalidDownloads(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty", data: nil},
+		{name: "json error", data: []byte(`{"code":"Forbidden","message":"denied"}`)},
+		{name: "html login page", data: []byte("<html><body>login</body></html>")},
+		{name: "plain text", data: []byte("document text")},
+		{name: "zip without word document", data: zipBytesContainingOnly(t, "other.txt", "x")},
 	}
-	f.dlCalls[documentID]++
-	if err := f.dlErrors[documentID]; err != nil {
-		return nil, err
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateDOCX(tt.data); err == nil {
+				t.Fatal("validateDOCX() error = nil, want rejection")
+			}
+		})
 	}
-	return f.downloads[documentID], nil
 }
 
-func testConnector(api dingTalkAPI) *Connector {
-	return &Connector{newAPI: func(*config) dingTalkAPI { return api }}
+func TestValidateDOCX_acceptsDOCX(t *testing.T) {
+	if err := validateDOCX(testDOCXBytes(t)); err != nil {
+		t.Fatalf("validateDOCX() error = %v", err)
+	}
 }
 
-func testConfig(resources ...string) *types.DataSourceConfig {
-	return &types.DataSourceConfig{
+func TestDownloadWikiDocContent_exportImmediateSuccess(t *testing.T) {
+	wantDOCX := testDOCXBytes(t)
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("submit method = %s, want POST", r.Method)
+		}
+		var body submitExportJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.DentryUUID != "doc-key" || body.OperatorID != "operator" || body.TargetFormat != "docx" {
+			t.Fatalf("submit body = %+v", body)
+		}
+		writeJSON(w, submitExportJobResponse{TaskID: "task-1", DownloadURL: srv.URL + "/download/document.docx"})
+	})
+	mux.HandleFunc("/download/document.docx", func(w http.ResponseWriter, r *http.Request) {
+		if token := r.Header.Get("x-acs-dingtalk-access-token"); token != "" {
+			t.Fatalf("export download leaked access token %q", token)
+		}
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+		_, _ = w.Write(wantDOCX)
+	})
+	mux.HandleFunc("/v2.0/doc/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("resolve dentry endpoint must not be called")
+	})
+	mux.HandleFunc("/v1.0/storage/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("storage download endpoint must not be called")
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("blocks endpoint must not be called")
+	})
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	data, fileName, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileName != "测试文档.docx" {
+		t.Fatalf("fileName = %q, want %q", fileName, "测试文档.docx")
+	}
+	if !bytes.Equal(data, wantDOCX) {
+		t.Fatal("returned bytes differ from downloaded DOCX")
+	}
+}
+
+func TestDownloadWikiDocContent_pollsExportUntilSuccess(t *testing.T) {
+	wantDOCX := testDOCXBytes(t)
+	queryCalls := 0
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, submitExportJobResponse{TaskID: "task-1"})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+		queryCalls++
+		if r.URL.Query().Get("operatorId") != "operator" || r.URL.Query().Get("taskId") != "task-1" {
+			t.Fatalf("query = %q", r.URL.RawQuery)
+		}
+		if queryCalls == 1 {
+			writeJSON(w, queryExportTaskResponse{Status: "processing"})
+			return
+		}
+		writeJSON(w, queryExportTaskResponse{Status: "success", DownloadURL: srv.URL + "/export.docx"})
+	})
+	mux.HandleFunc("/export.docx", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(wantDOCX)
+	})
+
+	client := NewClient(&Config{AppKey: "key", AppSecret: "secret", OperatorUnionID: "operator", BaseURL: srv.URL})
+	client.exportPollInterval = time.Nanosecond
+	client.exportMaxPolls = 3
+	data, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, wantDOCX) || queryCalls != 2 {
+		t.Fatalf("queryCalls=%d dataEqual=%v", queryCalls, bytes.Equal(data, wantDOCX))
+	}
+}
+
+func TestPollDocumentExport_terminalFailures(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      string
+		downloadURL string
+		want        string
+	}{
+		{name: "failed", status: "FAILED", want: "FAILED"},
+		{name: "success missing URL", status: "SUCCESS", want: "downloadUrl"},
+		{name: "unknown", status: "UNKNOWN", want: "UNKNOWN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+			})
+			mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, queryExportTaskResponse{Status: tt.status, DownloadURL: tt.downloadURL})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			client := NewClient(&Config{AppKey: "key", AppSecret: "secret", OperatorUnionID: "operator", BaseURL: srv.URL})
+			client.exportPollInterval = time.Nanosecond
+			client.exportMaxPolls = 1
+			_, err := client.pollDocumentExport(context.Background(), "task-1")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPollDocumentExport_timesOut(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, queryExportTaskResponse{Status: "PROCESSING"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	client := NewClient(&Config{AppKey: "key", AppSecret: "secret", OperatorUnionID: "operator", BaseURL: srv.URL})
+	client.exportPollInterval = time.Nanosecond
+	client.exportMaxPolls = 2
+	_, err := client.pollDocumentExport(context.Background(), "task-1")
+	if err == nil || !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("error = %v, want timeout", err)
+	}
+}
+
+func TestDownloadWikiDocContent_submitFailureDoesNotFallbackToBlocks(t *testing.T) {
+	blocksCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		writeJSON(w, map[string]string{
+			"code":      "Forbidden.ExportDenied",
+			"message":   "export denied",
+			"requestid": "export-request-1",
+		})
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		blocksCalls++
+		writeJSON(w, map[string]interface{}{"blocks": []interface{}{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	_, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err == nil {
+		t.Fatal("DownloadWikiDocContent() error = nil")
+	}
+	if blocksCalls != 0 {
+		t.Fatalf("blocks calls = %d, want 0", blocksCalls)
+	}
+	for _, want := range []string{"提交钉钉文档导出任务失败", "Forbidden.ExportDenied", "export-request-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestDownloadWikiDocContent_pollFailureDoesNotFallbackToBlocks(t *testing.T) {
+	blocksCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, submitExportJobResponse{TaskID: "task-1"})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/task/query", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		writeJSON(w, map[string]string{
+			"code":      "Forbidden.QueryDenied",
+			"message":   "query denied",
+			"requestId": "query-request-1",
+		})
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		blocksCalls++
+		writeJSON(w, map[string]interface{}{"blocks": []interface{}{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	client.exportPollInterval = time.Nanosecond
+	client.exportMaxPolls = 1
+	_, _, err := client.DownloadWikiDocContent(context.Background(), "doc-key", "测试文档.adoc", "adoc")
+	if err == nil {
+		t.Fatal("DownloadWikiDocContent() error = nil")
+	}
+	if blocksCalls != 0 {
+		t.Fatalf("blocks calls = %d, want 0", blocksCalls)
+	}
+	for _, want := range []string{"查询钉钉文档导出任务失败", "Forbidden.QueryDenied", "query-request-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestDownloadWikiDocViaBlocks_remainsAvailable(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc-key/blocks", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("operatorId") != "operator" {
+			t.Fatalf("operatorId = %q", r.URL.Query().Get("operatorId"))
+		}
+		writeJSON(w, map[string]interface{}{
+			"blocks": []interface{}{
+				map[string]interface{}{
+					"type": "paragraph",
+					"paragraph": map[string]interface{}{
+						"elements": []interface{}{
+							map[string]interface{}{"textRun": map[string]interface{}{"text": "说明"}},
+						},
+					},
+				},
+				map[string]interface{}{
+					"type": "table",
+					"table": map[string]interface{}{
+						"rows": []interface{}{
+							[]interface{}{"名称", "数量"},
+							[]interface{}{"苹果", "3"},
+						},
+					},
+				},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(&Config{
+		AppKey:          "key",
+		AppSecret:       "secret",
+		OperatorUnionID: "operator",
+		BaseURL:         srv.URL,
+	})
+	data, fileName, err := client.downloadWikiDocViaBlocks(context.Background(), "doc-key", "测试文档.adoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileName != "测试文档.md" {
+		t.Fatalf("fileName = %q, want 测试文档.md", fileName)
+	}
+	want := "说明\n\n| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"
+	if string(data) != want {
+		t.Fatalf("content = %q, want %q", data, want)
+	}
+}
+
+func fakeDingTalkServer(dentries []dentryItem) (*httptest.Server, *Config) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+
+	mux.HandleFunc("/v1.0/drive/spaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listSpacesResponse{
+			Spaces: []spaceItem{{SpaceID: "sp1", SpaceName: "Team Drive", SpaceType: "org"}},
+		})
+	})
+
+	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listDentriesResponse{Dentries: dentries})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		// GET single dentry (e.g. .../dentries/doc1)
+		id := strings.TrimPrefix(r.URL.Path, "/v1.0/storage/spaces/sp1/dentries/")
+		if strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		for _, d := range dentries {
+			if d.ID == id {
+				writeJSON(w, d)
+				return
+			}
+		}
+		writeJSON(w, dentryItem{ID: id, ParentID: ""})
+	})
+
+	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries/doc1/downloadInfos", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]string{"downloadUrl": ""})
+	})
+
+	mux.HandleFunc("/v1.0/doc/documents/doc1/content", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]string{"content": "# Hello\n\nDingTalk doc body."})
+	})
+
+	srv := httptest.NewServer(mux)
+	cfg := &Config{
+		AppKey:    "key",
+		AppSecret: "secret",
+		BaseURL:   srv.URL,
+	}
+	return srv, cfg
+}
+
+func fakeDingTalkWikiServer(t *testing.T, nodes []wikiNodeItem) (*httptest.Server, *Config) {
+	t.Helper()
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{
+			Workspaces: []wikiWorkspaceItem{{
+				WorkspaceID: "wk1",
+				Name:        "Knowledge",
+				RootNodeID:  "root1",
+				URL:         "https://alidocs.dingtalk.com/wiki/wk1",
+			}},
+		})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("parentNodeId") != "root1" {
+			writeJSON(w, listWikiNodesResponse{})
+			return
+		}
+		writeJSON(w, listWikiNodesResponse{Nodes: nodes})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/", func(w http.ResponseWriter, r *http.Request) {
+		nodeID := strings.TrimPrefix(r.URL.Path, "/v2.0/wiki/nodes/")
+		for _, n := range nodes {
+			if n.NodeID == nodeID {
+				writeJSON(w, map[string]interface{}{"node": n})
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/v1.0/doc/suites/documents/doc1/blocks", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("operatorId") != "operator" {
+			http.Error(w, `{"message":"missing operatorId"}`, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"blocks": []map[string]interface{}{
+				{
+					"type": "paragraph",
+					"paragraph": map[string]interface{}{
+						"elements": []map[string]interface{}{
+							{"textRun": map[string]string{"text": "# Wiki\n\nDingTalk wiki body."}},
+						},
+					},
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/v2.0/doc/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		docKey := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2.0/doc/dentries/"), "/queryDentryId")
+		writeJSON(w, dentryIDByUUIDResponse{
+			DentryUUID: docKey,
+			DentryID:   "backing-" + docKey,
+			SpaceID:    "wiki-space",
+		})
+	})
+	mux.HandleFunc("/v2.0/doc/me/export/submit", func(w http.ResponseWriter, r *http.Request) {
+		var body submitExportJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.DentryUUID == "missing" {
+			w.WriteHeader(http.StatusBadGateway)
+			writeJSON(w, map[string]string{"code": "ExportFailed", "message": "export unavailable"})
+			return
+		}
+		writeJSON(w, submitExportJobResponse{
+			TaskID:      "task-" + time.Now().Format("150405.000000"),
+			DownloadURL: srv.URL + "/download/wiki.docx",
+		})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/wiki-space/dentries/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/downloadInfos/query") {
+			http.NotFound(w, r)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/backing-missing/") {
+			http.Error(w, `{"code":"DownloadFailed","message":"download unavailable"}`, http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/wiki.docx"})
+	})
+	mux.HandleFunc("/download/wiki.docx", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+		_, _ = w.Write(testDOCXBytes(t))
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("operatorId") != "operator" {
+			http.Error(w, `{"message":"missing operatorId"}`, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, listWorkbookSheetsResponse{
+			Value: []workbookSheetItem{{
+				ID:   "Sheet1",
+				Name: "Sheet1",
+			}},
+		})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets/Sheet1/ranges/A1:AX600", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("operatorId") != "operator" {
+			http.Error(w, `{"message":"missing operatorId"}`, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"values": [][]string{
+				{"商品", "数量"},
+				{"苹果", "3"},
+			},
+		})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets/Sheet1/ranges/A601:AX1000", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("operatorId") != "operator" {
+			http.Error(w, `{"message":"missing operatorId"}`, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"values": [][]string{},
+		})
+	})
+
+	srv = httptest.NewServer(mux)
+	cfg := &Config{AppKey: "key", AppSecret: "secret", BaseURL: srv.URL}
+	return srv, cfg
+}
+
+func TestConnector_Type(t *testing.T) {
+	c := NewConnector()
+	if c.Type() != types.ConnectorTypeDingTalk {
+		t.Fatalf("type = %q", c.Type())
+	}
+}
+
+func TestExtractDingTalkBlockText_convertsMarkdownTableCells(t *testing.T) {
+	document := map[string]interface{}{
+		"blocks": []interface{}{
+			map[string]interface{}{
+				"type": "paragraph",
+				"paragraph": map[string]interface{}{
+					"elements": []interface{}{
+						map[string]interface{}{"textRun": map[string]interface{}{"text": "说明"}},
+					},
+				},
+			},
+			map[string]interface{}{
+				"type": "table",
+				"table": map[string]interface{}{
+					"rowSize": 2,
+					"colSize": 2,
+					"rows": []interface{}{
+						[]interface{}{
+							map[string]interface{}{"value": "名称"},
+							map[string]interface{}{"value": "数量"},
+						},
+						[]interface{}{
+							map[string]interface{}{"value": "苹果"},
+							map[string]interface{}{"value": "3"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := extractDingTalkBlockText(document)
+	want := "说明\n\n| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"
+	if got != want {
+		t.Fatalf("extractDingTalkBlockText() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractDingTalkBlockText_readsDingTalkResultDataTableCells(t *testing.T) {
+	document := map[string]interface{}{
+		"result": map[string]interface{}{
+			"data": []interface{}{
+				map[string]interface{}{
+					"blockType": "table",
+					"table": map[string]interface{}{
+						"cells": []interface{}{
+							[]interface{}{"名称", "数量"},
+							[]interface{}{"苹果", "3"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := extractDingTalkBlockText(document)
+	want := "| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"
+	if got != want {
+		t.Fatalf("extractDingTalkBlockText() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractDingTalkBlockText_convertsImageTableCellsToMarkdownLinks(t *testing.T) {
+	document := map[string]interface{}{
+		"result": map[string]interface{}{
+			"data": []interface{}{
+				map[string]interface{}{
+					"blockType": "table",
+					"table": map[string]interface{}{
+						"cells": []interface{}{
+							[]interface{}{"名称", "图片"},
+							[]interface{}{"商品", map[string]interface{}{
+								"type":  "image",
+								"image": map[string]interface{}{"url": "https://example.com/item.png"},
+							}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := extractDingTalkBlockText(document)
+	want := "| 名称 | 图片 |\n| --- | --- |\n| 商品 | ![](https://example.com/item.png) |"
+	if got != want {
+		t.Fatalf("extractDingTalkBlockText() = %q, want %q", got, want)
+	}
+}
+
+func TestParseDingTalkConfig_acceptsAppIDAlias(t *testing.T) {
+	cfg, _, err := parseDingTalkConfig(&types.DataSourceConfig{
+		Credentials: map[string]interface{}{
+			"app_id":     "key",
+			"app_secret": "secret",
+			"union_id":   "operator",
+		},
+	})
+	if err != nil {
+		t.Fatalf("parseDingTalkConfig: %v", err)
+	}
+	if cfg.AppKey != "key" || cfg.AppSecret != "secret" {
+		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestFetchIncremental_skipsUnchanged(t *testing.T) {
+	dentries := []dentryItem{{
+		ID:          "doc1",
+		Name:        "Spec",
+		Type:        "FILE",
+		Extension:   "docx",
+		UpdatedTime: "2026-01-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkServer(dentries)
+	defer srv.Close()
+
+	conn := NewConnector()
+	dsConfig := &types.DataSourceConfig{
 		Type: types.ConnectorTypeDingTalk,
 		Credentials: map[string]interface{}{
-			"client_id":     "ding-app",
-			"client_secret": "secret",
-			"operator_id":   "union-id",
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
 		},
-		ResourceIDs: resources,
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
 	}
-}
 
-// testConfigWithUploadedFiles turns include_uploaded_files on. Cases that
-// exercise the upload ingest path have to opt in, because the switch defaults
-// to off and testConfig deliberately leaves the settings bag empty.
-func testConfigWithUploadedFiles(resources ...string) *types.DataSourceConfig {
-	cfg := testConfig(resources...)
-	cfg.Settings = map[string]interface{}{"include_uploaded_files": true}
-	return cfg
-}
-
-func rawJSON(value string) json.RawMessage {
-	return json.RawMessage(value)
-}
-
-func TestConnectorListsWorkspacesAndFetchesNestedDocuments(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{
-			{ID: "b", RootNodeID: "root-b", Name: "Beta"},
-			{ID: "a", RootNodeID: "root-a", Name: "Alpha", Description: "Team docs"},
-		},
-		nodes: map[string][]node{
-			"root-a": {
-				{ID: "folder", Type: "FOLDER"},
-				{ID: "ignored", Type: "FILE", Category: "FILE", Extension: "pdf"},
-			},
-			"folder": {
-				{
-					ID: "doc-1", Type: "FILE", Category: "ALIDOC", Extension: "adoc",
-					Name: "Roadmap", WorkspaceID: "a", ModifiedTime: "2026-07-25T08:00:00Z",
-				},
+	ctx := context.Background()
+	prev := &types.SyncCursor{
+		ConnectorCursor: map[string]interface{}{
+			"parser_version": "4",
+			"doc_revisions": map[string]string{
+				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
 			},
 		},
-		blocks: map[string][]json.RawMessage{
-			"doc-1": {rawJSON(`{
-				"blockType":"paragraph",
-				"children":[{"elementType":"text","text":"Q3 goals","bold":true}]
-			}`)},
+	}
+
+	items, next, err := conn.FetchIncremental(ctx, dsConfig, prev)
+	if err != nil {
+		t.Fatalf("FetchIncremental: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 changed items, got %d", len(items))
+	}
+	if next == nil || next.ConnectorCursor == nil {
+		t.Fatal("expected next cursor")
+	}
+}
+
+func TestFetchIncremental_reprocessesWhenParserVersionChanges(t *testing.T) {
+	dentries := []dentryItem{{
+		ID:          "doc1",
+		Name:        "Spec",
+		Type:        "FILE",
+		Extension:   "md",
+		UpdatedTime: "2026-01-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkServer(dentries)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
 		},
-		nodeErrors:  make(map[string]error),
-		blockErrors: make(map[string]error),
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
 	}
-	connector := testConnector(api)
-
-	resources, err := connector.ListResources(context.Background(), testConfig(), "")
-	if err != nil {
-		t.Fatalf("ListResources() error = %v", err)
-	}
-	if len(resources) != 2 || resources[0].ExternalID != "a" || resources[1].ExternalID != "b" {
-		t.Fatalf("ListResources() = %#v, want workspaces sorted by name", resources)
-	}
-	if !resources[0].HasChildren {
-		t.Fatalf("workspace resource = %#v, want expandable", resources[0])
-	}
-	children, err := connector.ListResources(context.Background(), testConfig(), "a")
-	if err != nil || len(children) != 1 || children[0].Type != "folder" {
-		t.Fatalf("workspace children = %#v, %v; want one folder", children, err)
-	}
-	folderID := children[0].ExternalID
-	documents, err := connector.ListResources(context.Background(), testConfig(), folderID)
-	if err != nil || len(documents) != 1 || documents[0].Type != "document" {
-		t.Fatalf("folder children = %#v, %v; want one document", documents, err)
-	}
-	// A document is a leaf: expanding it is answered with no children rather
-	// than an error, so a picker expansion cannot turn a selection that syncs
-	// fine into a failure.
-	leafChildren, err := connector.ListResources(
-		context.Background(), testConfig(), documents[0].ExternalID,
-	)
-	if err != nil || len(leafChildren) != 0 {
-		t.Fatalf("expanding a document = %#v, %v; want no children", leafChildren, err)
-	}
-	ancestors, err := connector.ResolveResourceAncestors(
-		context.Background(), testConfig(), []string{documents[0].ExternalID},
-	)
-	if err != nil || len(ancestors) != 2 || ancestors[0] != "a" || ancestors[1] != folderID {
-		t.Fatalf("ResolveResourceAncestors() = %#v, %v", ancestors, err)
+	prev := &types.SyncCursor{
+		ConnectorCursor: map[string]interface{}{
+			"parser_version": "3",
+			"doc_revisions": map[string]string{
+				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
+			},
+		},
 	}
 
-	items, err := connector.FetchAll(context.Background(), testConfig("a"), []string{"a"})
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, prev)
 	if err != nil {
-		t.Fatalf("FetchAll() error = %v", err)
+		t.Fatalf("FetchIncremental: %v", err)
 	}
 	if len(items) != 1 {
-		t.Fatalf("FetchAll() returned %d items, want 1", len(items))
-	}
-	item := items[0]
-	if item.ExternalID != "doc-1" || item.Title != "Roadmap" ||
-		string(item.Content) != "# Roadmap\n\n**Q3 goals**\n" {
-		t.Fatalf("FetchAll() item = %#v", item)
-	}
-	if item.ContentType != "text/markdown" || item.SourceResourceID != "a" ||
-		item.Metadata["channel"] != types.ChannelDingtalk {
-		t.Fatalf("FetchAll() metadata = %#v", item)
+		t.Fatalf("expected 1 item after parser version change, got %d", len(items))
 	}
 }
 
-func TestIncrementalSyncRetriesFailuresAndReportsDeletions(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root", Name: "Space"}},
-		nodes: map[string][]node{
-			"root": {
-				{ID: "unchanged", Type: "FILE", Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r1"},
-				{ID: "changed", Type: "FILE", Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r2"},
-				{ID: "broken", Type: "FILE", Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r2"},
-			},
-		},
-		blocks: map[string][]json.RawMessage{
-			"changed": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"updated"}}`)},
-		},
-		nodeErrors:  make(map[string]error),
-		blockErrors: map[string]error{"broken": errors.New("permission denied")},
-	}
-	connector := testConnector(api)
-	cursorMap, err := encodeCursor(&cursorState{
-		Version: cursorVersion,
-		Resources: map[string]map[string]string{
-			"space": {
-				"unchanged": "r1",
-				"changed":   "r1",
-				"broken":    "r1",
-				"deleted":   "r1",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	items, next, syncErr := connector.FetchIncremental(
-		context.Background(),
-		testConfig("space"),
-		&types.SyncCursor{ConnectorCursor: cursorMap},
-	)
-	var partial *datasource.PartialFetchError
-	if !errors.As(syncErr, &partial) {
-		t.Fatalf("FetchIncremental() error = %v, want PartialFetchError", syncErr)
-	}
-	if next == nil {
-		t.Fatal("FetchIncremental() returned nil cursor")
-	}
-	if api.blockCalls["unchanged"] != 0 || api.blockCalls["changed"] != 1 ||
-		api.blockCalls["broken"] != 1 {
-		t.Fatalf("document block calls = %#v", api.blockCalls)
-	}
-
-	byID := make(map[string]types.FetchedItem, len(items))
-	for _, item := range items {
-		byID[item.ExternalID] = item
-	}
-	if len(byID) != 3 || !byID["deleted"].IsDeleted {
-		t.Fatalf("FetchIncremental() items = %#v", items)
-	}
-	if byID["broken"].Metadata["error"] == "" {
-		t.Fatalf("failed item metadata = %#v", byID["broken"].Metadata)
-	}
-
-	decoded, err := decodeCursor(next)
-	if err != nil {
-		t.Fatal(err)
-	}
-	revisions := decoded.Resources["space"]
-	if revisions["unchanged"] != "r1" || revisions["changed"] != "r2" ||
-		revisions["broken"] != "r1" {
-		t.Fatalf("next cursor revisions = %#v", revisions)
-	}
-	if _, exists := revisions["deleted"]; exists {
-		t.Fatalf("deleted document remained in cursor: %#v", revisions)
-	}
-}
-
-func TestIncrementalSyncDoesNotInferDeletionsFromIncompleteTree(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
-		nodes: map[string][]node{
-			"root": {{ID: "folder", Type: "FOLDER"}},
-		},
-		nodeErrors:  map[string]error{"folder": errors.New("temporary failure")},
-		blockErrors: make(map[string]error),
-	}
-	cursorMap, err := encodeCursor(&cursorState{
-		Version: cursorVersion,
-		Resources: map[string]map[string]string{
-			"space": {"existing": "r1"},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	items, next, err := testConnector(api).FetchIncremental(
-		context.Background(),
-		testConfig("space"),
-		&types.SyncCursor{ConnectorCursor: cursorMap},
-	)
-	var partial *datasource.PartialFetchError
-	if !errors.As(err, &partial) {
-		t.Fatalf("FetchIncremental() error = %v, want PartialFetchError", err)
-	}
-	if len(items) != 1 || items[0].Metadata["error_reason_code"] != "dingtalk_resource_failed" || next == nil {
-		t.Fatalf("FetchIncremental() = %#v, %#v; want preserved cursor", items, next)
-	}
-	decoded, decodeErr := decodeCursor(next)
-	if decodeErr != nil {
-		t.Fatal(decodeErr)
-	}
-	if decoded.Resources["space"]["existing"] != "r1" {
-		t.Fatalf("preserved cursor = %#v", decoded.Resources)
-	}
-}
-
-func TestConnectorSupportsFolderAndDocumentScopesWithoutDuplicates(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
-		nodes: map[string][]node{
-			"root": {
-				{ID: "folder", WorkspaceID: "space", Type: "FOLDER", Name: "Folder"},
-				{
-					ID: "standalone", WorkspaceID: "space", Type: "FILE",
-					Category: "ALIDOC", Extension: "adoc", Name: "Standalone",
-				},
-			},
-			"folder": {
-				{
-					ID: "nested", WorkspaceID: "space", Type: "FILE",
-					Category: "ALIDOC", Extension: "adoc", Name: "Nested",
-				},
-			},
-		},
-		blocks: map[string][]json.RawMessage{
-			"standalone": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"one"}}`)},
-			"nested":     {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"two"}}`)},
-		},
-		nodeErrors:  make(map[string]error),
-		blockErrors: make(map[string]error),
-	}
-	connector := testConnector(api)
-	folderID, err := encodeResourceReference(resourceReference{
-		WorkspaceID: "space", NodeID: "folder",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	nestedID, err := encodeResourceReference(resourceReference{
-		WorkspaceID: "space", NodeID: "nested", Ancestors: []string{"folder"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	standaloneID, err := encodeResourceReference(resourceReference{
-		WorkspaceID: "space", NodeID: "standalone",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	items, err := connector.FetchAll(
-		context.Background(),
-		testConfig(folderID, nestedID, standaloneID),
-		[]string{folderID, nestedID, standaloneID},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 2 || api.blockCalls["nested"] != 1 || api.blockCalls["standalone"] != 1 {
-		t.Fatalf("items = %#v, block calls = %#v", items, api.blockCalls)
-	}
-	byID := make(map[string]types.FetchedItem, len(items))
-	for _, item := range items {
-		byID[item.ExternalID] = item
-	}
-	if byID["nested"].SourceResourceID != folderID ||
-		byID["standalone"].SourceResourceID != standaloneID {
-		t.Fatalf("source resource IDs = %#v", byID)
-	}
-}
-
-func TestConnectorRejectsCrossWorkspaceResourcePath(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{
-			{ID: "space-a", RootNodeID: "root-a"},
-			{ID: "space-b", RootNodeID: "root-b"},
-		},
-		nodes: map[string][]node{
-			"root-a": {{
-				ID: "foreign", WorkspaceID: "space-b", Type: "FILE",
-				Category: "ALIDOC", Extension: "adoc",
-			}},
-		},
-		nodeErrors:  make(map[string]error),
-		blockErrors: make(map[string]error),
-	}
-	resourceID, err := encodeResourceReference(resourceReference{
-		WorkspaceID: "space-a", NodeID: "foreign",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	items, err := testConnector(api).FetchAll(
-		context.Background(), testConfig(resourceID), []string{resourceID},
-	)
-	var partial *datasource.PartialFetchError
-	if !errors.As(err, &partial) || len(items) != 1 ||
-		!strings.Contains(items[0].Metadata["error"], "different workspace") || len(api.blockCalls) != 0 {
-		t.Fatalf("FetchAll() = %#v, %v; want isolated workspace mismatch", items, err)
-	}
-}
-
-func TestDecodeCursorMigratesWorkspaceCursorV1(t *testing.T) {
-	cursor := &types.SyncCursor{ConnectorCursor: map[string]interface{}{
-		"version": 1,
-		"workspaces": map[string]interface{}{
-			"legacy-space": map[string]interface{}{"document": "revision"},
-		},
+func TestFetchIncremental_fetchesWhenRevisionChanges(t *testing.T) {
+	dentries := []dentryItem{{
+		ID:          "doc1",
+		Name:        "Spec",
+		Type:        "FILE",
+		Extension:   "md",
+		UpdatedTime: "2026-06-01T00:00:00Z",
 	}}
-	decoded, err := decodeCursor(cursor)
+	srv, cfg := fakeDingTalkServer(dentries)
+	defer srv.Close()
+
+	conn := NewConnector()
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
+		Settings: map[string]interface{}{
+			"include_subfolders": true,
+		},
+	}
+
+	prev := &types.SyncCursor{
+		ConnectorCursor: map[string]interface{}{
+			"doc_revisions": map[string]string{
+				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
+			},
+		},
+	}
+
+	items, _, err := conn.FetchIncremental(context.Background(), dsConfig, prev)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("FetchIncremental: %v", err)
 	}
-	if decoded.Version != cursorVersion ||
-		decoded.Resources["legacy-space"]["document"] != "revision" {
-		t.Fatalf("decoded cursor = %#v", decoded)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-}
-
-func TestParseConfigRejectsMissingCredentials(t *testing.T) {
-	for _, credentials := range []map[string]interface{}{
-		nil,
-		{"client_id": "app"},
-		{"client_id": "app", "client_secret": "secret"},
-		{"client_id": 42, "client_secret": "secret", "operator_id": "operator"},
-	} {
-		_, err := parseConfig(&types.DataSourceConfig{Credentials: credentials})
-		if !errors.Is(err, datasource.ErrInvalidCredentials) {
-			t.Fatalf("parseConfig(%#v) error = %v", credentials, err)
-		}
+	if len(items[0].Content) == 0 {
+		t.Fatal("expected content bytes")
 	}
 }
 
-func TestNodeRevisionPrefersMillisecondTimestamp(t *testing.T) {
-	n := node{ModifiedTime: "2023-05-15T11:29Z", ModifiedTimestamp: 1_684_148_940_123}
-	if n.revision() != "1684148940123" {
-		t.Fatalf("revision() = %q, want millisecond timestamp", n.revision())
-	}
-	if got := n.modifiedAt(); got.UnixMilli() != 1_684_148_940_123 {
-		t.Fatalf("modifiedAt() = %s", got)
-	}
+func TestFetchIncremental_driveAdocNormalizesToMarkdown(t *testing.T) {
+	dentries := []dentryItem{{
+		ID:          "doc1",
+		Name:        "测试用.adoc",
+		Type:        "FILE",
+		Extension:   "adoc",
+		UpdatedTime: "2026-06-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkServer(dentries)
+	defer srv.Close()
 
-	onlyTime := node{ModifiedTime: "2023-05-15T11:29Z"}
-	if onlyTime.revision() != "2023-05-15T11:29Z" {
-		t.Fatalf("revision() without timestamp = %q", onlyTime.revision())
-	}
-	if onlyTime.modifiedAt().IsZero() {
-		t.Fatal("modifiedAt() rejected documented minute-precision time")
-	}
-}
-
-func TestParseDingTalkTimeAcceptsMinutePrecision(t *testing.T) {
-	parsed := parseDingTalkTime("2023-05-15T11:29Z")
-	if parsed.IsZero() || parsed.UTC().Format("2006-01-02T15:04Z") != "2023-05-15T11:29Z" {
-		t.Fatalf("parseDingTalkTime() = %s", parsed)
-	}
-}
-
-func TestValidateProbesNodeAndDocumentAccess(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
-		nodes: map[string][]node{
-			"root": {syncDocument()},
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
 		},
-		blocks: map[string][]json.RawMessage{
-			"doc": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"ok"}}`)},
-		},
-		nodeErrors:  make(map[string]error),
-		blockErrors: make(map[string]error),
-	}
-	if err := testConnector(api).Validate(context.Background(), testConfig()); err != nil {
-		t.Fatalf("Validate() error = %v", err)
-	}
-	if api.blockCalls["doc"] != 1 {
-		t.Fatalf("document probe calls = %#v", api.blockCalls)
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
 	}
 
-	api.blockErrors["doc"] = errors.New("missing Storage.File.Read")
-	if err := testConnector(api).Validate(context.Background(), testConfig()); err == nil {
-		t.Fatal("Validate() error = nil, want document access failure")
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental: %v", err)
 	}
-
-	api = &fakeAPI{
-		workspaces:  []workspace{{ID: "space", RootNodeID: "root"}},
-		nodes:       map[string][]node{},
-		nodeErrors:  map[string]error{"root": errors.New("missing Wiki.Node.Read")},
-		blockErrors: make(map[string]error),
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-	if err := testConnector(api).Validate(context.Background(), testConfig()); err == nil {
-		t.Fatal("Validate() error = nil, want node access failure")
+	if items[0].FileName != "测试用.md" {
+		t.Fatalf("FileName = %q, want 测试用.md", items[0].FileName)
+	}
+	if items[0].ContentType != "text/markdown" {
+		t.Fatalf("ContentType = %q, want text/markdown", items[0].ContentType)
 	}
 }
 
-// Expanding a document is answered with no children rather than an error: a
-// leaf genuinely has none, and the picker renders an error as a failed
-// expansion — a toast on a step whose selection syncs perfectly well. The
-// listing already reports HasChildren=false for a document, which keeps the
-// picker from offering the expander; this is the answer for a client that
-// expands anyway, or for a selection saved by a build that did offer it.
-func TestListResourcesReportsNoChildrenForALeafDocument(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "team", RootNodeID: "team-root", Name: "Team"}},
-		nodes: map[string][]node{
-			"team-root": {{
-				ID: "doc-1", WorkspaceID: "team", Name: "Plan.adoc",
-				Type: "FILE", Category: "ALIDOC", Extension: "adoc",
-			}},
+func TestFetchIncremental_emitsDeletedItemsForMissingDocs(t *testing.T) {
+	srv, cfg := fakeDingTalkServer(nil)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
+	}
+	prev := &types.SyncCursor{
+		ConnectorCursor: map[string]interface{}{
+			"doc_revisions": map[string]string{
+				makeStableDocExternalID("sp1", "doc1"): "2026-01-01T00:00:00Z",
+			},
 		},
 	}
-	documentID, err := encodeResourceReference(resourceReference{
-		WorkspaceID: "team", NodeID: "doc-1",
+
+	items, next, err := NewConnector().FetchIncremental(context.Background(), dsConfig, prev)
+	if err != nil {
+		t.Fatalf("FetchIncremental: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 deleted item, got %d", len(items))
+	}
+	if !items[0].IsDeleted {
+		t.Fatalf("expected deleted item, got %+v", items[0])
+	}
+	if items[0].ExternalID != makeStableDocExternalID("sp1", "doc1") {
+		t.Fatalf("ExternalID = %q", items[0].ExternalID)
+	}
+	var cursor dingtalkCursor
+	b, _ := json.Marshal(next.ConnectorCursor)
+	if err := json.Unmarshal(b, &cursor); err != nil {
+		t.Fatalf("unmarshal next cursor: %v", err)
+	}
+	if _, ok := cursor.DocRevisions[makeStableDocExternalID("sp1", "doc1")]; ok {
+		t.Fatalf("deleted doc remained in next cursor: %+v", cursor.DocRevisions)
+	}
+}
+
+func TestFetchAll_ChildDentryListErrorReturnsPartialItems(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("parentId") {
+		case "0":
+			writeJSON(w, listDentriesResponse{Dentries: []dentryItem{
+				{ID: "folder1", Name: "No Permission Folder", Type: "FOLDER", UpdatedTime: "2026-06-01T00:00:00Z"},
+				{ID: "peer1", Name: "Peer", Type: "FILE", Extension: "md", UpdatedTime: "2026-06-01T00:00:00Z"},
+			}})
+		case "folder1":
+			http.Error(w, `{"message":"permission denied"}`, http.StatusForbidden)
+		default:
+			writeJSON(w, listDentriesResponse{})
+		}
+	})
+	mux.HandleFunc("/v1.0/doc/documents/peer1/content", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]string{"content": "# Peer\n\nDingTalk doc body."})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
 
-	resources, err := testConnector(api).ListResources(context.Background(), testConfig(), documentID)
-	if err != nil {
-		t.Fatalf("ListResources(%q) error = %v, want an empty listing", documentID, err)
-	}
-	if len(resources) != 0 {
-		t.Fatalf("ListResources(%q) = %#v, want no children", documentID, resources)
-	}
-}
-
-// captureLogs redirects the process logger into a buffer for one test. The sync
-// log is the surface a skipped node has to appear on, so it is asserted on
-// directly rather than through an internal counter.
-func captureLogs(t *testing.T) *bytes.Buffer {
-	t.Helper()
-	var buffer bytes.Buffer
-	logger.SetOutput(&buffer)
-	t.Cleanup(logger.ConfigureFromEnv)
-	return &buffer
-}
-
-// skippedNodesFixture mixes supported documents with the node types this
-// connector deliberately cannot ingest, spread over a folder tree: reporting
-// must survive nesting and must not disturb what is fetched.
-func skippedNodesFixture() *fakeAPI {
-	return &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root", Name: "Space"}},
-		nodes: map[string][]node{
-			"root": {
-				{ID: "docs", WorkspaceID: "space", Name: "Docs", Type: "FOLDER"},
-				{
-					ID: "video-1", WorkspaceID: "space", Name: "Lesson.mp4", Type: "FILE",
-					Category: "VIDEO", Extension: "mp4",
-				},
-				{
-					ID: "table-1", WorkspaceID: "space", Name: "Roadmap.able", Type: "FILE",
-					Category: "ALIDOC", Extension: "able",
-				},
-			},
-			"docs": {
-				{
-					ID: "doc-1", WorkspaceID: "space", Name: "Runbook.adoc", Type: "FILE",
-					Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r1",
-				},
-				{
-					ID: "doc-2", WorkspaceID: "space", Name: "Policy.adoc", Type: "FILE",
-					Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r2",
-				},
-				{
-					ID: "mind-1", WorkspaceID: "space", Name: "Plan.amind", Type: "FILE",
-					Category: "ALIDOC", Extension: "amind",
-				},
-				{ID: "empty", WorkspaceID: "space", Name: "Empty", Type: "FOLDER"},
-			},
-			"empty": nil,
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    "key",
+			"app_secret": "secret",
+			"union_id":   "operator",
+			"base_url":   srv.URL,
 		},
-		blocks: map[string][]json.RawMessage{
-			"doc-1": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"run"}}`)},
-			"doc-2": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"policy"}}`)},
-		},
-		nodeErrors:  make(map[string]error),
-		blockErrors: make(map[string]error),
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
 	}
-}
 
-// Seeing an unsupported node must not change what is fetched: the supported
-// siblings still sync exactly as before, and nothing is requested for a skip.
-func TestFetchAllKeepsSyncingSupportedSiblingsOfSkippedNodes(t *testing.T) {
-	api := skippedNodesFixture()
-	items, err := testConnector(api).FetchAll(
-		context.Background(), testConfig("space"), []string{"space"},
-	)
+	items, err := NewConnector().FetchAll(context.Background(), dsConfig, []string{makeSpaceResourceID("sp1")})
 	if err != nil {
-		t.Fatalf("FetchAll() error = %v", err)
+		t.Fatalf("FetchAll must not abort when one child listing fails: %v", err)
 	}
 	if len(items) != 2 {
-		t.Fatalf("FetchAll() returned %d items, want 2: %#v", len(items), items)
+		t.Fatalf("want 2 items (1 fetched + 1 failure placeholder), got %d: %+v", len(items), items)
 	}
-	byID := make(map[string]types.FetchedItem, len(items))
-	for _, item := range items {
-		byID[item.ExternalID] = item
-	}
-	if len(byID) != 2 || byID["doc-1"].ContentType != "text/markdown" ||
-		byID["doc-2"].ContentType != "text/markdown" {
-		t.Fatalf("supported documents = %#v", byID)
-	}
-	for _, skipped := range []string{"video-1", "table-1", "mind-1"} {
-		if _, exists := byID[skipped]; exists {
-			t.Fatalf("unsupported node %q was synced: %#v", skipped, byID[skipped])
-		}
-		if api.blockCalls[skipped] != 0 {
-			t.Fatalf("unsupported node %q was requested: %#v", skipped, api.blockCalls)
+
+	var peer, placeholder *types.FetchedItem
+	for i := range items {
+		switch {
+		case items[i].ExternalID == makeStableDocExternalID("sp1", "peer1") && len(items[i].Content) > 0:
+			peer = &items[i]
+		case items[i].Metadata["error"] != "":
+			placeholder = &items[i]
 		}
 	}
-	if len(api.blockCalls) != 2 || api.blockCalls["doc-1"] != 1 || api.blockCalls["doc-2"] != 1 {
-		t.Fatalf("block calls = %#v, want one per supported document", api.blockCalls)
+	if peer == nil {
+		t.Fatalf("expected peer document to be fetched: %+v", items)
+	}
+	if placeholder == nil {
+		t.Fatalf("expected failure placeholder: %+v", items)
+	}
+	if placeholder.Title != "No Permission Folder" {
+		t.Fatalf("placeholder title = %q", placeholder.Title)
+	}
+	if placeholder.Metadata["channel"] != types.ChannelDingtalk {
+		t.Fatalf("placeholder channel = %q", placeholder.Metadata["channel"])
+	}
+	if placeholder.Metadata["failure_stage"] != "list_children" {
+		t.Fatalf("placeholder metadata = %+v", placeholder.Metadata)
 	}
 }
 
-// Every node the connector drops must reach the sync log with its identity and
-// the concrete reason it cannot be ingested: media is never downloaded on
-// purpose, while a native DingTalk type simply has no ingest path yet.
-func TestSyncLogsEverySkippedNodeWithItsReason(t *testing.T) {
-	api := skippedNodesFixture()
-	logs := captureLogs(t)
-	if _, err := testConnector(api).FetchAll(
-		context.Background(), testConfig("space"), []string{"space"},
-	); err != nil {
-		t.Fatalf("FetchAll() error = %v", err)
-	}
+func TestListResources_root(t *testing.T) {
+	srv, cfg := fakeDingTalkServer(nil)
+	defer srv.Close()
 
-	output := logs.String()
-	for _, want := range []string{
-		`[DingTalk] skip node video-1 (name="Lesson.mp4" type=FILE category=VIDEO extension=mp4): ` +
-			"video/media files are deliberately not downloaded by this connector",
-		`[DingTalk] skip node table-1 (name="Roadmap.able" type=FILE category=ALIDOC extension=able): ` +
-			"DingTalk multi-dimensional table has no ingest path in this connector yet",
-		`[DingTalk] skip node mind-1 (name="Plan.amind" type=FILE category=ALIDOC extension=amind): ` +
-			"DingTalk mind map has no ingest path in this connector yet",
-	} {
-		if !strings.Contains(output, want) {
-			t.Fatalf("sync log is missing:\n%s\ngot:\n%s", want, output)
-		}
-	}
-	for _, folder := range []string{"skip node docs", "skip node empty"} {
-		if strings.Contains(output, folder) {
-			t.Fatalf("folder reported as a skipped node: %q in\n%s", folder, output)
-		}
-	}
-}
-
-// The per-scope summary states how much of the scope arrived, in the same shape
-// as the IMA connector's per-knowledge-base line.
-func TestSyncLogsPerScopeSummary(t *testing.T) {
-	api := skippedNodesFixture()
-	logs := captureLogs(t)
-	if _, err := testConnector(api).FetchAll(
-		context.Background(), testConfig("space"), []string{"space"},
-	); err != nil {
-		t.Fatalf("FetchAll() error = %v", err)
-	}
-	want := "[DingTalk] scope space/root: total=5 synced=2 skipped=3 failed=0"
-	if !strings.Contains(logs.String(), want) {
-		t.Fatalf("sync log is missing %q:\n%s", want, logs.String())
-	}
-}
-
-// A transient read failure is counted as failed — not as skipped — is logged as
-// retryable, and still leaves the document out of the cursor.
-func TestSyncSummaryCountsTransientFailuresAndStillRetries(t *testing.T) {
-	api := skippedNodesFixture()
-	api.blockErrors = map[string]error{"doc-2": errors.New("storage temporarily unavailable")}
-	logs := captureLogs(t)
-
-	items, err := testConnector(api).FetchAll(
-		context.Background(), testConfig("space"), []string{"space"},
-	)
-	var partial *datasource.PartialFetchError
-	if !errors.As(err, &partial) {
-		t.Fatalf("FetchAll() error = %v, want PartialFetchError", err)
-	}
-	if len(items) != 2 {
-		t.Fatalf("FetchAll() items = %#v, want 1 document and 1 failure", items)
-	}
-	output := logs.String()
-	if !strings.Contains(output, "storage temporarily unavailable") ||
-		!strings.Contains(output, "failed, will retry next sync") {
-		t.Fatalf("transient failure was not logged as retryable:\n%s", output)
-	}
-	want := "[DingTalk] scope space/root: total=5 synced=1 skipped=3 failed=1"
-	if !strings.Contains(output, want) {
-		t.Fatalf("sync log is missing %q:\n%s", want, output)
-	}
-}
-
-// Containers are not content: a tree of folders alone must produce no skip
-// report at all, only a zeroed summary.
-func TestSyncLogsNoSkipsForFolderOnlyTree(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
-		nodes: map[string][]node{
-			"root":  {{ID: "outer", WorkspaceID: "space", Name: "Outer", Type: "FOLDER"}},
-			"outer": {{ID: "inner", WorkspaceID: "space", Name: "Inner", Type: "FOLDER"}},
-			"inner": nil,
+	conn := NewConnector()
+	dsConfig := &types.DataSourceConfig{
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"union_id":   "operator",
+			"base_url":   cfg.BaseURL,
 		},
 	}
-	logs := captureLogs(t)
-	items, err := testConnector(api).FetchAll(
-		context.Background(), testConfig("space"), []string{"space"},
-	)
-	if err != nil || len(items) != 0 {
-		t.Fatalf("FetchAll() = %#v, %v; want no items", items, err)
-	}
-	output := logs.String()
-	if strings.Contains(output, "skip node") {
-		t.Fatalf("folder-only tree reported skips:\n%s", output)
-	}
-	want := "[DingTalk] scope space/root: total=0 synced=0 skipped=0 failed=0"
-	if !strings.Contains(output, want) {
-		t.Fatalf("sync log is missing %q:\n%s", want, output)
-	}
-}
-
-// scanScope hands the caller the skipped nodes with their DingTalk identity
-// intact, and a single-document scope has no tree to skip anything from.
-func TestScanScopeReportsSkippedNodesAndSingleDocumentScopeHasNone(t *testing.T) {
-	api := skippedNodesFixture()
-	documents, skipped, err := scanScope(context.Background(), api, syncScope{
-		ResourceID:  "resource",
-		Reference:   resourceReference{WorkspaceID: "space"},
-		StartNodeID: "root",
-	}, documentSettings{})
+	res, err := conn.ListResources(context.Background(), dsConfig, "")
 	if err != nil {
-		t.Fatalf("scanScope() error = %v", err)
+		t.Fatalf("ListResources: %v", err)
 	}
-	if len(documents) != 2 {
-		t.Fatalf("scanScope() documents = %#v, want 2", documents)
-	}
-	if len(skipped) != 3 {
-		t.Fatalf("scanScope() skipped = %#v, want 3", skipped)
-	}
-	got := make(map[string]node, len(skipped))
-	for _, item := range skipped {
-		got[item.ID] = item
-	}
-	if got["video-1"].Category != "VIDEO" || got["video-1"].Extension != "mp4" ||
-		got["video-1"].Name != "Lesson.mp4" ||
-		got["table-1"].Category != "ALIDOC" || got["table-1"].Extension != "able" ||
-		got["mind-1"].Extension != "amind" {
-		t.Fatalf("skipped nodes lost their identity: %#v", got)
-	}
-
-	document := syncDocument()
-	documents, skipped, err = scanScope(context.Background(), api, syncScope{
-		ResourceID: "resource",
-		Reference:  resourceReference{WorkspaceID: "space"},
-		Document:   &document,
-	}, documentSettings{})
-	if err != nil || len(documents) != 1 || documents[0].ID != "doc" || len(skipped) != 0 {
-		t.Fatalf("single-document scanScope() = %#v, %#v, %v", documents, skipped, err)
+	if len(res) != 1 || res[0].Type != "space" {
+		t.Fatalf("unexpected resources: %+v", res)
 	}
 }
 
-// The reason has to say which kind of unsupported a node is: a video is skipped
-// on purpose, a native type has simply not been implemented, and an uploaded
-// file the connector could read is skipped only because its switch is off.
-func TestSkipReasonDistinguishesMediaFromUnimplementedTypes(t *testing.T) {
-	enabled := documentSettings{IncludeUploadedFiles: true}
-	for _, testCase := range []struct {
-		label    string
-		node     node
-		settings documentSettings
-		want     string
-	}{
-		{
-			"video category",
-			node{Type: "FILE", Category: "VIDEO", Extension: "mp4"},
-			documentSettings{},
-			"video/media files are deliberately not downloaded by this connector",
-		},
-		{
-			"video extension without a category",
-			node{Type: "FILE", Category: "OTHER", Extension: "MOV"},
-			documentSettings{},
-			"video/media files are deliberately not downloaded by this connector",
-		},
-		{
-			"audio extension",
-			node{Type: "FILE", Category: "OTHER", Extension: "mp3"},
-			documentSettings{},
-			"video/media files are deliberately not downloaded by this connector",
-		},
-		{
-			// Only the types with a name worth printing are in the map; every
-			// other unsupported node gets the generic reason. Kept as a
-			// regression guard on the map.
-			"type without a dedicated label",
-			node{Type: "FILE", Category: "ALIDOC", Extension: "axls"},
-			documentSettings{},
-			"no ingest path for this DingTalk node type in this connector yet",
-		},
-		{
-			"multidimensional table",
-			node{Type: "FILE", Category: "ALIDOC", Extension: "able"},
-			documentSettings{},
-			"DingTalk multi-dimensional table has no ingest path in this connector yet",
-		},
-		{
-			"mind map",
-			node{Type: "FILE", Category: "ALIDOC", Extension: "amind"},
-			documentSettings{},
-			"DingTalk mind map has no ingest path in this connector yet",
-		},
-		{
-			"unknown type",
-			node{Type: "FILE", Category: "OTHER", Extension: "bin"},
-			documentSettings{},
-			"no ingest path for this DingTalk node type in this connector yet",
-		},
-		{
-			// The skip is not a missing feature: the file is readable, the data
-			// source simply never opted in, and the log has to say so.
-			"uploaded file with the switch off",
-			node{Type: "FILE", Category: "DOCUMENT", Extension: "docx"},
-			documentSettings{},
-			"uploaded files are not ingested because include_uploaded_files is not enabled for this data source",
-		},
-		{
-			"uploaded file with the switch explicitly off",
-			node{Type: "FILE", Category: "DOCUMENT", Extension: "pdf"},
-			documentSettings{IncludeUploadedFiles: false},
-			"uploaded files are not ingested because include_uploaded_files is not enabled for this data source",
-		},
-		{
-			// A node that is not an uploaded file keeps its own reason even
-			// while the switch is on, so the switch never relabels a node it
-			// does not govern.
-			"unsupported type with the switch on",
-			node{Type: "FILE", Category: "ALIDOC", Extension: "amind"},
-			enabled,
-			"DingTalk mind map has no ingest path in this connector yet",
-		},
-		{
-			"media with the switch on",
-			node{Type: "FILE", Category: "VIDEO", Extension: "mp4"},
-			enabled,
-			"video/media files are deliberately not downloaded by this connector",
-		},
-	} {
-		t.Run(testCase.label, func(t *testing.T) {
-			if got := skipReason(testCase.node, testCase.settings); got != testCase.want {
-				t.Fatalf("skipReason() = %q, want %q", got, testCase.want)
-			}
-		})
-	}
-}
+func TestListResources_wikiRootAndChildren(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID:      "doc1",
+		WorkspaceID: "wk1",
+		Name:        "Wiki Spec",
+		Type:        "FILE",
+		Category:    "ALIDOC",
+		URL:         "https://alidocs.dingtalk.com/i/nodes/doc1",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
 
-// The switch is read from the settings bag the way Yuque reads its own, and a
-// missing or malformed value keeps uploaded files out.
-func TestParseDocumentSettingsReadsTheUploadedFilesSwitch(t *testing.T) {
-	for _, testCase := range []struct {
-		label    string
-		settings map[string]interface{}
-		want     bool
-	}{
-		{"unset", nil, false},
-		{"empty bag", map[string]interface{}{}, false},
-		{"explicit true", map[string]interface{}{"include_uploaded_files": true}, true},
-		{"explicit false", map[string]interface{}{"include_uploaded_files": false}, false},
-		{"string true", map[string]interface{}{"include_uploaded_files": "true"}, true},
-		{"string ON", map[string]interface{}{"include_uploaded_files": " ON "}, true},
-		{"string 1", map[string]interface{}{"include_uploaded_files": "1"}, true},
-		{"string yes", map[string]interface{}{"include_uploaded_files": "yes"}, true},
-		{"string off", map[string]interface{}{"include_uploaded_files": "off"}, false},
-		{"string False", map[string]interface{}{"include_uploaded_files": "False"}, false},
-		{"string 0", map[string]interface{}{"include_uploaded_files": "0"}, false},
-		{"string no", map[string]interface{}{"include_uploaded_files": "no"}, false},
-		{"garbage string", map[string]interface{}{"include_uploaded_files": "maybe"}, false},
-		{"wrong type", map[string]interface{}{"include_uploaded_files": 1}, false},
-		// A switch for another type must never turn this one on.
-		{"unrelated key", map[string]interface{}{"include_sheets": true}, false},
-	} {
-		t.Run(testCase.label, func(t *testing.T) {
-			cfg := testConfig()
-			cfg.Settings = testCase.settings
-			if got := parseDocumentSettings(cfg).IncludeUploadedFiles; got != testCase.want {
-				t.Fatalf("IncludeUploadedFiles = %v, want %v", got, testCase.want)
-			}
-		})
-	}
-	// A nil config cannot be parsed by the connector, but reading its settings
-	// must not panic either.
-	if got := parseDocumentSettings(nil).IncludeUploadedFiles; got {
-		t.Fatalf("parseDocumentSettings(nil).IncludeUploadedFiles = true, want false")
-	}
-}
-
-// binaryNode is an uploaded file as the wiki API lists it: a FILE in the
-// DOCUMENT category carrying the original extension.
-func binaryNode(id, name, extension string) node {
-	return node{
-		ID: id, WorkspaceID: "space", Name: name, Type: "FILE",
-		Category: "DOCUMENT", Extension: extension, ModifiedTime: "2026-07-25T08:00:00Z",
-	}
-}
-
-func uploadedDocumentsFixture() *fakeAPI {
-	return &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
-		nodes: map[string][]node{
-			"root": {
-				{
-					ID: "adoc", WorkspaceID: "space", Name: "Runbook.adoc", Type: "FILE",
-					Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r1",
-				},
-				binaryNode("docx", "Employee-Handbook.docx", "docx"),
-				binaryNode("pptx", "Deck.pptx", "pptx"),
-				binaryNode("xlsx", "Sheet.xlsx", "xlsx"),
-				binaryNode("pdf", "Policy.pdf", "pdf"),
-				{
-					ID: "video", WorkspaceID: "space", Name: "Lesson.mp4", Type: "FILE",
-					Category: "VIDEO", Extension: "mp4",
-				},
-				{
-					ID: "aitable", WorkspaceID: "space", Name: "Table.able", Type: "FILE",
-					Category: "ALIDOC", Extension: "able",
-				},
-			},
+	conn := NewConnector()
+	dsConfig := &types.DataSourceConfig{
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"base_url":   cfg.BaseURL,
 		},
-		blocks: map[string][]json.RawMessage{
-			"adoc": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"run"}}`)},
-		},
-		downloads: map[string][]byte{
-			"docx": []byte("PK\x03\x04word-bytes"),
-			"pptx": []byte("PK\x03\x04slides-bytes"),
-			"xlsx": []byte("PK\x03\x04sheet-bytes"),
-			"pdf":  []byte("%PDF-1.7-policy-bytes"),
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
 		},
 	}
-}
-
-// Uploaded Office and PDF files must be downloaded byte-for-byte with a
-// concrete content type and a file name that keeps exactly one extension, while
-// adoc keeps going through the blocks API and unsupported nodes are left out.
-func TestFetchAllDownloadsUploadedDocuments(t *testing.T) {
-	api := uploadedDocumentsFixture()
-	items, err := testConnector(api).FetchAll(
-		context.Background(), testConfigWithUploadedFiles("space"), []string{"space"},
-	)
+	roots, err := conn.ListResources(context.Background(), dsConfig, "")
 	if err != nil {
-		t.Fatalf("FetchAll() error = %v", err)
+		t.Fatalf("ListResources root: %v", err)
 	}
-	if len(items) != 5 {
-		t.Fatalf("FetchAll() returned %d items, want 5: %#v", len(items), items)
+	if len(roots) != 1 || roots[0].ExternalID != makeWikiWorkspaceResourceID("wk1") {
+		t.Fatalf("unexpected roots: %+v", roots)
 	}
-
-	byID := make(map[string]types.FetchedItem, len(items))
-	for _, item := range items {
-		byID[item.ExternalID] = item
+	children, err := conn.ListResources(context.Background(), dsConfig, roots[0].ExternalID)
+	if err != nil {
+		t.Fatalf("ListResources children: %v", err)
 	}
-	for _, skipped := range []string{"video", "aitable"} {
-		if _, exists := byID[skipped]; exists {
-			t.Fatalf("unsupported node %q was synced: %#v", skipped, byID[skipped])
-		}
-	}
-	if api.blockCalls["adoc"] != 1 || len(api.blockCalls) != 1 {
-		t.Fatalf("block calls = %#v, want only the adoc document", api.blockCalls)
-	}
-	if len(api.dlCalls) != 4 {
-		t.Fatalf("download calls = %#v, want one per uploaded document", api.dlCalls)
-	}
-
-	want := []struct {
-		id          string
-		contentType string
-		fileName    string
-		content     string
-	}{
-		{
-			"docx",
-			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-			"Employee-Handbook.docx",
-			"PK\x03\x04word-bytes",
-		},
-		{
-			"pptx",
-			"application/vnd.openxmlformats-officedocument.presentationml.presentation",
-			"Deck.pptx",
-			"PK\x03\x04slides-bytes",
-		},
-		{
-			"xlsx",
-			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			"Sheet.xlsx",
-			"PK\x03\x04sheet-bytes",
-		},
-		{"pdf", "application/pdf", "Policy.pdf", "%PDF-1.7-policy-bytes"},
-	}
-	for _, expected := range want {
-		item, exists := byID[expected.id]
-		if !exists {
-			t.Fatalf("uploaded document %q was not synced: %#v", expected.id, byID)
-		}
-		if string(item.Content) != expected.content || item.ContentType != expected.contentType ||
-			item.FileName != expected.fileName {
-			t.Fatalf("%s item = %#v (content_type %q, file_name %q)",
-				expected.id, item, item.ContentType, item.FileName)
-		}
-		if item.SourceResourceID != "space" || item.Metadata["extension"] == "" ||
-			item.Metadata["channel"] != types.ChannelDingtalk {
-			t.Fatalf("%s metadata = %#v", expected.id, item.Metadata)
-		}
-		if item.URL == "" || item.UpdatedAt.IsZero() {
-			t.Fatalf("%s lost its URL or timestamp: %#v", expected.id, item)
-		}
-	}
-	if byID["adoc"].ContentType != "text/markdown" ||
-		string(byID["adoc"].Content) != "# Runbook.adoc\n\nrun\n" {
-		t.Fatalf("adoc item = %#v", byID["adoc"])
+	if len(children) != 1 || children[0].ExternalID != makeWikiNodeResourceID("wk1", "doc1") {
+		t.Fatalf("unexpected children: %+v", children)
 	}
 }
 
-// Selecting an uploaded file directly must resolve to a single-document scope.
-func TestFetchAllHandlesUploadedDocumentSelection(t *testing.T) {
-	api := uploadedDocumentsFixture()
-	resourceID, err := encodeResourceReference(resourceReference{
-		WorkspaceID: "space", NodeID: "docx",
+func TestFetchIncremental_wikiFetchesChangedDoc(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID:      "doc1",
+		WorkspaceID: "wk1",
+		Name:        "测试用.adoc",
+		Type:        "FILE",
+		Category:    "ALIDOC",
+		URL:         "https://alidocs.dingtalk.com/i/nodes/doc1",
+		UpdatedTime: "2026-06-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
+	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental wiki: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Metadata["dingtalk_doc_type"] != "wiki" {
+		t.Fatalf("unexpected metadata: %+v", items[0].Metadata)
+	}
+	if items[0].FileName != "测试用.docx" {
+		t.Fatalf("FileName = %q, want 测试用.docx", items[0].FileName)
+	}
+	if items[0].ContentType != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+		t.Fatalf("ContentType = %q, want DOCX", items[0].ContentType)
+	}
+	if err := validateDOCX(items[0].Content); err != nil {
+		t.Fatalf("unexpected DOCX content: %v", err)
+	}
+}
+
+func TestFetchIncremental_wikiSpreadsheetUsesWorkbookAPI(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID:      "sheet1",
+		WorkspaceID: "wk1",
+		Name:        "测试用2.xlsx",
+		Type:        "FILE",
+		Category:    "SPREADSHEET",
+		URL:         "https://alidocs.dingtalk.com/i/nodes/sheet1",
+		UpdatedTime: "2026-06-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
+	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental wiki sheet: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Metadata["error"] != "" {
+		t.Fatalf("unexpected fetch error: %+v", items[0].Metadata)
+	}
+	if items[0].FileName != "测试用2.md" {
+		t.Fatalf("FileName = %q, want 测试用2.md", items[0].FileName)
+	}
+	body := string(items[0].Content)
+	for _, want := range []string{"# 测试用2.xlsx", "## Sheet1", "| 商品 | 数量 |", "| 苹果 | 3 |"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("content missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestFetchIncremental_nativeSheetWithoutMetadataUsesContentFingerprint(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID: "sheet1", WorkspaceID: "wk1", Name: "在线表格.axls", Type: "FILE", Category: "SPREADSHEET",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
+	config := &types.DataSourceConfig{
+		Type:        types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{"app_key": cfg.AppKey, "app_secret": cfg.AppSecret, "base_url": cfg.BaseURL},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings:    map[string]interface{}{"union_id": "operator", "dingtalk_type": "wiki"},
+	}
+	connector := NewConnector()
+	first, cursor, err := connector.FetchIncremental(context.Background(), config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Metadata["dingtalk_doc_kind"] != string(dingtalkDocumentKindNativeSheet) {
+		t.Fatalf("first sync = %+v", first)
+	}
+	second, _, err := connector.FetchIncremental(context.Background(), config, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("unchanged sheet was re-emitted: %+v", second)
+	}
+	var saved dingtalkCursor
+	raw, _ := json.Marshal(cursor.ConnectorCursor)
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.SheetFingerprints[makeStableWikiDocExternalID("wk1", "sheet1")] == "" {
+		t.Fatalf("missing sheet fingerprint: %+v", saved)
+	}
+}
+
+func TestFetchIncremental_nativeSheetContentChangeIsDetectedWithoutMetadata(t *testing.T) {
+	var rangeCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "token", ExpireIn: 7200})
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	items, err := testConnector(api).FetchAll(
-		context.Background(), testConfigWithUploadedFiles(resourceID), []string{resourceID},
-	)
-	if err != nil {
-		t.Fatalf("FetchAll() error = %v", err)
-	}
-	if len(items) != 1 || items[0].ExternalID != "docx" ||
-		string(items[0].Content) != "PK\x03\x04word-bytes" ||
-		items[0].SourceResourceID != resourceID {
-		t.Fatalf("FetchAll() = %#v", items)
-	}
-	if len(api.dlCalls) != 1 || api.dlCalls["docx"] != 1 {
-		t.Fatalf("download calls = %#v", api.dlCalls)
-	}
-}
-
-// A failed download must surface as a retryable failure item and must not
-// advance the cursor, exactly like a failed block read.
-func TestIncrementalSyncRetriesUploadedDownloadFailures(t *testing.T) {
-	api := uploadedDocumentsFixture()
-	document := binaryNode("docx", "Employee-Handbook.docx", "docx")
-	document.ModifiedTimestamp = 1_768_000_000_000
-	api.nodes["root"] = []node{document}
-	api.dlErrors = map[string]error{"docx": errors.New("unsupported file type")}
-
-	cursorMap, err := encodeCursor(&cursorState{
-		Version:   cursorVersion,
-		Resources: map[string]map[string]string{"space": {"docx": "r1"}},
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", RootNodeID: "root1"}}})
 	})
-	if err != nil {
-		t.Fatal(err)
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{NodeID: "sheet1", WorkspaceID: "wk1", Name: "在线表格.axls", Type: "FILE", Category: "SPREADSHEET"}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/sheet1", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{NodeID: "sheet1", WorkspaceID: "wk1", Name: "在线表格.axls", Type: "FILE", Category: "SPREADSHEET"}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWorkbookSheetsResponse{Value: []workbookSheetItem{{ID: "tab1", Name: "Sheet1", RowCount: 2, ColumnCount: 2}}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets/tab1/ranges/A1:B2", func(w http.ResponseWriter, r *http.Request) {
+		rangeCalls++
+		value := "old"
+		if rangeCalls > 1 {
+			value = "new"
+		}
+		writeJSON(w, map[string]interface{}{"values": [][]string{{"字段", "值"}, {"状态", value}}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	config := &types.DataSourceConfig{
+		Type:        types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{"app_key": "key", "app_secret": "secret", "base_url": srv.URL},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings:    map[string]interface{}{"union_id": "operator", "dingtalk_type": "wiki"},
 	}
-	items, next, syncErr := testConnector(api).FetchIncremental(
-		context.Background(), testConfigWithUploadedFiles("space"), &types.SyncCursor{ConnectorCursor: cursorMap},
-	)
-	var partial *datasource.PartialFetchError
-	if !errors.As(syncErr, &partial) {
-		t.Fatalf("FetchIncremental() error = %v, want PartialFetchError", syncErr)
+	connector := NewConnector()
+	first, cursor, err := connector.FetchIncremental(context.Background(), config, nil)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first sync items=%+v err=%v", first, err)
 	}
-	if len(items) != 1 || items[0].Metadata["error_reason_code"] != "dingtalk_document_failed" ||
-		!strings.Contains(items[0].Metadata["error"], "unsupported file type") ||
-		len(items[0].Content) != 0 {
-		t.Fatalf("failure item = %#v", items)
+	second, _, err := connector.FetchIncremental(context.Background(), config, cursor)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("changed sheet items=%+v err=%v", second, err)
 	}
-	state, err := decodeCursor(next)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Resources["space"]["docx"] != "r1" {
-		t.Fatalf("failed download advanced the cursor: %#v", state.Resources)
-	}
-
-	// The same document succeeds once the provider recovers.
-	delete(api.dlErrors, "docx")
-	items, _, err = testConnector(api).FetchIncremental(
-		context.Background(), testConfigWithUploadedFiles("space"), &types.SyncCursor{ConnectorCursor: cursorMap},
-	)
-	if err != nil || len(items) != 1 || string(items[0].Content) != "PK\x03\x04word-bytes" {
-		t.Fatalf("retry result = %#v, %v", items, err)
+	if !strings.Contains(string(second[0].Content), "new") {
+		t.Fatalf("changed content = %q", second[0].Content)
 	}
 }
 
-// Validate must prove an uploaded document is reachable without paying for the
-// transfer, and must still report a provider refusal.
-func TestValidateProbesUploadedDocumentsWithoutDownloading(t *testing.T) {
-	api := &fakeAPI{
-		workspaces: []workspace{{ID: "space", RootNodeID: "root", Name: "Space"}},
-		nodes: map[string][]node{
-			"root": {binaryNode("docx", "Employee-Handbook.docx", "docx")},
+func TestFetchIncremental_wikiDocumentCategoryAxlsUsesWorkbookAPI(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID:      "sheet1",
+		WorkspaceID: "wk1",
+		Name:        "在线测试表.axls",
+		Type:        "FILE",
+		Category:    "DOCUMENT",
+		URL:         "https://alidocs.dingtalk.com/i/nodes/sheet1",
+		UpdatedTime: "2026-06-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
 		},
 	}
-
-	if err := testConnector(api).Validate(context.Background(), testConfigWithUploadedFiles()); err != nil {
-		t.Fatalf("Validate() error = %v", err)
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental wiki axls sheet: %v", err)
 	}
-	if api.verifyCalls["docx"] != 1 || len(api.dlCalls) != 0 {
-		t.Fatalf("verify calls = %#v, download calls = %#v", api.verifyCalls, api.dlCalls)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-
-	api.verifyErrors = map[string]error{"docx": errors.New("missing Storage.File.Read")}
-	err := testConnector(api).Validate(context.Background(), testConfigWithUploadedFiles())
-	if err == nil || !strings.Contains(err.Error(), "missing Storage.File.Read") {
-		t.Fatalf("Validate() error = %v, want provider refusal", err)
+	if items[0].Metadata["error"] != "" {
+		t.Fatalf("unexpected fetch error: %+v", items[0].Metadata)
 	}
-}
-
-// switchStates are the three states every switch test has to cover: the key is
-// absent from a data source created before the switch existed, explicitly
-// false, and explicitly true.
-func switchStates(t *testing.T, key string) []struct {
-	label    string
-	settings map[string]interface{}
-	on       bool
-} {
-	t.Helper()
-	return []struct {
-		label    string
-		settings map[string]interface{}
-		on       bool
-	}{
-		{key + " unset", nil, false},
-		{key + " explicitly off", map[string]interface{}{key: false}, false},
-		{key + " explicitly on", map[string]interface{}{key: true}, true},
+	if items[0].Metadata["dingtalk_doc_kind"] != string(dingtalkDocumentKindNativeSheet) {
+		t.Fatalf("doc kind = %q, want native sheet", items[0].Metadata["dingtalk_doc_kind"])
+	}
+	if !strings.Contains(string(items[0].Content), "| 商品 | 数量 |") {
+		t.Fatalf("expected sheet markdown content, got %s", string(items[0].Content))
 	}
 }
 
-// Validate must honour the switch: with it off an uploaded file is not a
-// document, so it is neither probed nor treated as the one readable document a
-// data source has to prove. With it on the same file is probed through the
-// download-location lookup, never through the body transfer.
-func TestValidateHonoursTheUploadedFilesSwitch(t *testing.T) {
-	for _, testCase := range switchStates(t, "include_uploaded_files") {
-		t.Run(testCase.label, func(t *testing.T) {
-			api := &fakeAPI{
-				workspaces: []workspace{{ID: "space", RootNodeID: "root", Name: "Space"}},
-				nodes: map[string][]node{
-					"root": {binaryNode("docx", "Employee-Handbook.docx", "docx")},
-				},
-				verifyErrors: map[string]error{"docx": errors.New("missing Storage.File.Read")},
-			}
-			cfg := testConfig()
-			cfg.Settings = testCase.settings
+func TestFetchIncremental_wikiUnsupportedOnlineCreationIsSkipped(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID:      "whiteboard1",
+		WorkspaceID: "wk1",
+		Name:        "讨论白板",
+		Type:        "FILE",
+		Category:    "WHITEBOARD",
+		UpdatedTime: "2026-06-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
 
-			err := testConnector(api).Validate(context.Background(), cfg)
-			if testCase.on {
-				if err == nil || !strings.Contains(err.Error(), "missing Storage.File.Read") {
-					t.Fatalf("Validate() error = %v, want the probe to fail loudly", err)
-				}
-				if api.verifyCalls["docx"] != 1 {
-					t.Fatalf("verify calls = %#v, want exactly one upload probe", api.verifyCalls)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("Validate() error = %v, want acceptance with nothing to probe", err)
-				}
-				if len(api.verifyCalls) != 0 {
-					t.Fatalf("verify calls = %#v, want no upload probe while the switch is off", api.verifyCalls)
-				}
-			}
-			if len(api.dlCalls) != 0 {
-				t.Fatalf("download calls = %#v, want no body transfer during validation", api.dlCalls)
-			}
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
+	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental unsupported online creation: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 skipped item, got %d", len(items))
+	}
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] == "" {
+		t.Fatalf("expected skip placeholder, got %+v", items[0].Metadata)
+	}
+	if !strings.Contains(items[0].Metadata["skip_reason"], "暂不支持同步钉钉白板") {
+		t.Fatalf("unexpected skip reason: %s", items[0].Metadata["skip_reason"])
+	}
+}
+
+func TestFetchIncremental_downloadFailureDoesNotAdvanceRevision(t *testing.T) {
+	nodes := []wikiNodeItem{{
+		NodeID:      "missing",
+		WorkspaceID: "wk1",
+		Name:        "坏文档.adoc",
+		Type:        "FILE",
+		Category:    "ALIDOC",
+		UpdatedTime: "2026-06-01T00:00:00Z",
+	}}
+	srv, cfg := fakeDingTalkWikiServer(t, nodes)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    cfg.AppKey,
+			"app_secret": cfg.AppSecret,
+			"base_url":   cfg.BaseURL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
+	}
+	items, next, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental failed item: %v", err)
+	}
+	if len(items) != 1 || items[0].Metadata["error"] == "" {
+		t.Fatalf("expected one failed item, got %+v", items)
+	}
+	var cursor dingtalkCursor
+	b, _ := json.Marshal(next.ConnectorCursor)
+	if err := json.Unmarshal(b, &cursor); err != nil {
+		t.Fatalf("unmarshal next cursor: %v", err)
+	}
+	if _, ok := cursor.DocRevisions[makeStableWikiDocExternalID("wk1", "missing")]; ok {
+		t.Fatalf("failed item advanced cursor: %+v", cursor.DocRevisions)
+	}
+}
+
+func TestFetchIncremental_emptyWikiSpreadsheetIsSkippedAndAdvancesRevision(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{
+			Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", RootNodeID: "root1"}},
 		})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{
+			NodeID:      "sheet1",
+			WorkspaceID: "wk1",
+			Name:        "空表格.axls",
+			Type:        "FILE",
+			Category:    "SPREADSHEET",
+			UpdatedTime: "2026-07-24T04:38:00Z",
+		}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/sheet1", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{
+			NodeID:      "sheet1",
+			WorkspaceID: "wk1",
+			Name:        "空表格.axls",
+			Type:        "FILE",
+			Category:    "SPREADSHEET",
+			UpdatedTime: "2026-07-24T04:38:00Z",
+		}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWorkbookSheetsResponse{Value: []workbookSheetItem{{
+			ID: "tab1", Name: "Sheet1", RowCount: 10, ColumnCount: 5,
+		}}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/sheet1/sheets/tab1/ranges/A1:E10", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"values": [][]string{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key": "key", "app_secret": "secret", "base_url": srv.URL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id": "operator", "dingtalk_type": "wiki",
+		},
 	}
-}
-
-// The picker follows the same switch, so a node the sync would skip is never
-// offered for selection.
-func TestListResourcesHonoursTheUploadedFilesSwitch(t *testing.T) {
-	for _, testCase := range switchStates(t, "include_uploaded_files") {
-		t.Run(testCase.label, func(t *testing.T) {
-			api := uploadedDocumentsFixture()
-			rootID, err := encodeResourceReference(resourceReference{WorkspaceID: "space"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg := testConfig()
-			cfg.Settings = testCase.settings
-
-			resources, err := testConnector(api).ListResources(context.Background(), cfg, rootID)
-			if err != nil {
-				t.Fatalf("ListResources() error = %v", err)
-			}
-			names := make(map[string]bool, len(resources))
-			for _, resource := range resources {
-				names[resource.Name] = true
-			}
-			if !names["Runbook.adoc"] {
-				t.Fatalf("the adoc document is missing from %#v", names)
-			}
-			for _, uploaded := range []string{"Employee-Handbook.docx", "Deck.pptx", "Sheet.xlsx", "Policy.pdf"} {
-				if names[uploaded] != testCase.on {
-					t.Fatalf("resource %q listed = %v, want %v (%#v)",
-						uploaded, names[uploaded], testCase.on, names)
-				}
-			}
-			// A node with no ingest path is hidden either way.
-			if names["Table.able"] || names["Lesson.mp4"] {
-				t.Fatalf("unsupported nodes were listed: %#v", names)
-			}
-		})
-	}
-}
-
-// Full sync and incremental sync share one scan, so the switch has to hold in
-// both. With it off, the pre-#3786 behaviour stands: the uploaded files are
-// reported as skipped with an actionable reason and never downloaded.
-func TestSyncHonoursTheUploadedFilesSwitch(t *testing.T) {
-	for _, testCase := range switchStates(t, "include_uploaded_files") {
-		t.Run(testCase.label, func(t *testing.T) {
-			api := uploadedDocumentsFixture()
-			cfg := testConfig("space")
-			cfg.Settings = testCase.settings
-			logs := captureLogs(t)
-
-			items, err := testConnector(api).FetchAll(context.Background(), cfg, []string{"space"})
-			if err != nil {
-				t.Fatalf("FetchAll() error = %v", err)
-			}
-			wantUploads := testCase.on
-			for _, id := range []string{"docx", "pptx", "xlsx", "pdf"} {
-				got := false
-				for _, item := range items {
-					if item.ExternalID == id {
-						got = true
-					}
-				}
-				if got != wantUploads {
-					t.Fatalf("FetchAll() synced %q = %v, want %v: %#v", id, got, wantUploads, items)
-				}
-			}
-			if hasAdoc := func() bool {
-				for _, item := range items {
-					if item.ExternalID == "adoc" {
-						return true
-					}
-				}
-				return false
-			}(); !hasAdoc {
-				t.Fatalf("adoc document disappeared from %#v", items)
-			}
-
-			downloads := len(api.dlCalls)
-			if wantUploads && downloads != 4 {
-				t.Fatalf("download calls = %#v, want one per uploaded document", api.dlCalls)
-			}
-			if !wantUploads {
-				if downloads != 0 {
-					t.Fatalf("download calls = %#v, want none while the switch is off", api.dlCalls)
-				}
-				wantLog := "uploaded files are not ingested because include_uploaded_files " +
-					"is not enabled for this data source"
-				if !strings.Contains(logs.String(), wantLog) {
-					t.Fatalf("skip log is missing %q:\n%s", wantLog, logs.String())
-				}
-			}
-
-			// The incremental path walks the same scan, so it must agree.
-			api.dlCalls = nil
-			cursorMap, err := encodeCursor(&cursorState{
-				Version:   cursorVersion,
-				Resources: map[string]map[string]string{"space": {}},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			items, _, err = testConnector(api).FetchIncremental(
-				context.Background(), cfg, &types.SyncCursor{ConnectorCursor: cursorMap},
-			)
-			if err != nil {
-				t.Fatalf("FetchIncremental() error = %v", err)
-			}
-			wantItems := 1
-			if wantUploads {
-				wantItems = 5
-			}
-			if len(items) != wantItems {
-				t.Fatalf("FetchIncremental() returned %d items, want %d: %#v", len(items), wantItems, items)
-			}
-			if wantUploads && len(api.dlCalls) != 4 {
-				t.Fatalf("incremental download calls = %#v, want one per uploaded document", api.dlCalls)
-			}
-			if !wantUploads && len(api.dlCalls) != 0 {
-				t.Fatalf("incremental download calls = %#v, want none while the switch is off", api.dlCalls)
-			}
-		})
-	}
-}
-
-// Selecting an uploaded file directly is a scope the sync cannot resolve while
-// the switch is off, exactly as it could not before the upload path existed.
-func TestSelectingAnUploadedFileNeedsTheSwitch(t *testing.T) {
-	api := uploadedDocumentsFixture()
-	resourceID, err := encodeResourceReference(resourceReference{WorkspaceID: "space", NodeID: "docx"})
+	items, next, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := testConfig(resourceID)
-	cfg.Settings = map[string]interface{}{"include_uploaded_files": false}
-
-	items, err := testConnector(api).FetchAll(context.Background(), cfg, []string{resourceID})
-	var partial *datasource.PartialFetchError
-	if !errors.As(err, &partial) {
-		t.Fatalf("FetchAll() error = %v, want PartialFetchError", err)
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
 	}
-	if len(api.dlCalls) != 0 {
-		t.Fatalf("download calls = %#v, want none while the switch is off", api.dlCalls)
+	if items[0].Metadata["error"] != "" {
+		t.Fatalf("empty spreadsheet reported error: %+v", items[0].Metadata)
 	}
-	if len(items) != 1 || items[0].Metadata["error_reason_code"] != "dingtalk_resource_failed" {
-		t.Fatalf("FetchAll() = %#v, want one failed resource", items)
+	if reason := items[0].Metadata["skip_reason"]; !strings.Contains(reason, "暂无单元格内容") {
+		t.Fatalf("skip reason = %q", reason)
 	}
-}
-
-func TestBinaryDocumentFileNameKeepsASingleExtension(t *testing.T) {
-	for _, testCase := range []struct {
-		name      string
-		extension string
-		want      string
-	}{
-		{"Employee-Handbook.docx", "docx", "Employee-Handbook.docx"},
-		{"Deck", "pptx", "Deck.pptx"},
-		{"Report.PDF", "pdf", "Report.pdf"},
-		{"quarterly/2026:sheet.xlsx", "xlsx", "quarterly_2026_sheet.xlsx"},
-		{"", "xlsx", "untitled.xlsx"},
-		{".pdf", "pdf", "untitled.pdf"},
-	} {
-		t.Run(testCase.name+"."+testCase.extension, func(t *testing.T) {
-			got := binaryDocumentFileName(node{Name: testCase.name, Extension: testCase.extension})
-			if got != testCase.want {
-				t.Fatalf("binaryDocumentFileName() = %q, want %q", got, testCase.want)
-			}
-		})
+	var cursor dingtalkCursor
+	raw, _ := json.Marshal(next.ConnectorCursor)
+	if err := json.Unmarshal(raw, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	externalID := makeStableWikiDocExternalID("wk1", "sheet1")
+	if cursor.DocRevisions[externalID] == "" {
+		t.Fatalf("empty spreadsheet did not advance revision: %+v", cursor.DocRevisions)
 	}
 }
 
-// isDocument answers whether a read path exists at all, and isIngestible
-// answers whether this data source takes the node: the blocks API for adoc
-// always, the 钉盘 download API for an uploaded file only once
-// include_uploaded_files is on. Native DingTalk types stay out either way, so
-// nothing is ever enumerated that the sync cannot read.
-func TestNodeDocumentClassification(t *testing.T) {
-	for _, testCase := range []struct {
-		label    string
-		node     node
-		document bool
-		online   bool
-		binary   bool
-	}{
-		{"adoc", node{Type: "FILE", Category: "ALIDOC", Extension: "adoc"}, true, true, false},
-		{"axls", node{Type: "FILE", Category: "ALIDOC", Extension: "axls"}, false, false, false},
-		{"docx", node{Type: "FILE", Category: "DOCUMENT", Extension: "docx"}, true, false, true},
-		{"pptx", node{Type: "FILE", Category: "DOCUMENT", Extension: "pptx"}, true, false, true},
-		{"xlsx", node{Type: "FILE", Category: "DOCUMENT", Extension: "xlsx"}, true, false, true},
-		{"pdf", node{Type: "FILE", Category: "DOCUMENT", Extension: "pdf"}, true, false, true},
-		{"uppercase", node{Type: "file", Category: "document", Extension: "PDF"}, true, false, true},
-		{"mp4", node{Type: "FILE", Category: "VIDEO", Extension: "mp4"}, false, false, false},
-		{"aitable", node{Type: "FILE", Category: "ALIDOC", Extension: "able"}, false, false, false},
-		{"mindmap", node{Type: "FILE", Category: "ALIDOC", Extension: "amind"}, false, false, false},
-		{"upload category", node{Type: "FILE", Category: "FILE", Extension: "pdf"}, false, false, false},
-		{"other category", node{Type: "FILE", Category: "OTHER", Extension: "docx"}, false, false, false},
-		{"folder", node{Type: "FOLDER", Extension: "docx"}, false, false, false},
-		{"no extension", node{Type: "FILE", Category: "DOCUMENT"}, false, false, false},
-	} {
-		t.Run(testCase.label, func(t *testing.T) {
-			if got := testCase.node.isDocument(); got != testCase.document {
-				t.Fatalf("isDocument() = %v, want %v", got, testCase.document)
-			}
-			if got := testCase.node.isOnlineDocument(); got != testCase.online {
-				t.Fatalf("isOnlineDocument() = %v, want %v", got, testCase.online)
-			}
-			if got := testCase.node.isBinaryDocument(); got != testCase.binary {
-				t.Fatalf("isBinaryDocument() = %v, want %v", got, testCase.binary)
-			}
-			// Off by default: with every switch unset only the native adoc
-			// path is admitted, and the switch must never admit a node that
-			// has no read path at all.
-			if got := testCase.node.isIngestible(documentSettings{}); got != testCase.online {
-				t.Fatalf("isIngestible(off) = %v, want %v", got, testCase.online)
-			}
-			enabled := documentSettings{IncludeUploadedFiles: true}
-			if got := testCase.node.isIngestible(enabled); got != testCase.document {
-				t.Fatalf("isIngestible(on) = %v, want %v", got, testCase.document)
-			}
+func TestFetchIncremental_wikiUploadedSpreadsheetIsDownloaded(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{
+			Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", Name: "Knowledge", RootNodeID: "root1"}},
 		})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{
+			NodeID:      "file1",
+			WorkspaceID: "wk1",
+			Name:        "上传表格.xlsx",
+			Type:        "FILE",
+			Category:    "DOCUMENT",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/file1", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{
+			NodeID:      "file1",
+			WorkspaceID: "wk1",
+			Name:        "上传表格.xlsx",
+			Type:        "FILE",
+			Category:    "DOCUMENT",
+			SpaceID:     "drive-sp1",
+			DentryID:    "drive-file1",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/file1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"not workbook"}`, http.StatusBadRequest)
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/uploaded.xlsx"})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/download/uploaded.xlsx", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+		_, _ = w.Write([]byte("uploaded spreadsheet bytes"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    "key",
+			"app_secret": "secret",
+			"base_url":   srv.URL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
 	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental wiki uploaded sheet: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] != "" {
+		t.Fatalf("expected downloaded attachment, got %+v", items[0].Metadata)
+	}
+	if string(items[0].Content) != "uploaded spreadsheet bytes" || items[0].FileName != "上传表格.xlsx" {
+		t.Fatalf("downloaded attachment content mismatch, got file=%q len=%d", items[0].FileName, len(items[0].Content))
+	}
+	if items[0].ContentType != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" {
+		t.Fatalf("content type = %q", items[0].ContentType)
+	}
+}
+
+func TestFetchIncremental_wikiDocumentXlsxWithoutLocatorIsSkipped(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{
+			Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", Name: "Knowledge", RootNodeID: "root1"}},
+		})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{
+			NodeID:      "file1",
+			WorkspaceID: "wk1",
+			Name:        "上传表格.xlsx",
+			Type:        "FILE",
+			Category:    "DOCUMENT",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/file1", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{
+			NodeID:      "file1",
+			WorkspaceID: "wk1",
+			Name:        "上传表格.xlsx",
+			Type:        "FILE",
+			Category:    "DOCUMENT",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}})
+	})
+	mux.HandleFunc("/v1.0/doc/workbooks/file1/sheets", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("DOCUMENT .xlsx without workbook metadata should be skipped before workbook API")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    "key",
+			"app_secret": "secret",
+			"base_url":   srv.URL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
+	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental wiki uploaded-like sheet: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 skipped item, got %d", len(items))
+	}
+	if items[0].Metadata["skip_reason"] == "" {
+		t.Fatalf("expected skip reason, got %+v", items[0].Metadata)
+	}
+	if items[0].Metadata["dingtalk_doc_kind"] != string(dingtalkDocumentKindUploadedFile) {
+		t.Fatalf("doc kind = %q, want uploaded file", items[0].Metadata["dingtalk_doc_kind"])
+	}
+}
+
+func TestNormalizeWikiDocumentKind_DocumentOfficeTextFilesAreUploadedFiles(t *testing.T) {
+	for _, name := range []string{"测试文档_纯文本.txt", "测试报告_Word文档.docx", "README_测试说明.md"} {
+		got := normalizeWikiDocumentKind(wikiNodeItem{
+			NodeID:   "file1",
+			Name:     name,
+			Type:     "FILE",
+			Category: "DOCUMENT",
+		})
+		if got != dingtalkDocumentKindUploadedFile {
+			t.Fatalf("normalizeWikiDocumentKind(%q) = %q, want %q", name, got, dingtalkDocumentKindUploadedFile)
+		}
+	}
+}
+
+func TestNormalizeWikiDocumentKind_DocumentNativeDocStaysNative(t *testing.T) {
+	for _, name := range []string{"在线文档.adoc", "在线文档"} {
+		got := normalizeWikiDocumentKind(wikiNodeItem{
+			NodeID:   "doc1",
+			Name:     name,
+			Type:     "FILE",
+			Category: "DOCUMENT",
+		})
+		if got != dingtalkDocumentKindNativeDoc {
+			t.Fatalf("normalizeWikiDocumentKind(%q) = %q, want %q", name, got, dingtalkDocumentKindNativeDoc)
+		}
+	}
+}
+
+func TestNormalizeWikiDocumentKind_UploadedUnsupportedFormatsAreSkipped(t *testing.T) {
+	for _, name := range []string{"archive.zip", "video.mp4", "drawing.dwg", "binary.exe", "unknown.bin"} {
+		got := normalizeWikiDocumentKind(wikiNodeItem{
+			NodeID: "file1", Name: name, Type: "FILE", Category: "DOCUMENT",
+			SpaceID: "storage-space", DentryID: "storage-file",
+		})
+		if got != dingtalkDocumentKindSkipped {
+			t.Fatalf("normalizeWikiDocumentKind(%q) = %q, want skipped", name, got)
+		}
+	}
+}
+
+func TestNormalizeWikiDocumentKind_UploadedSupportedFormatsAreDownloaded(t *testing.T) {
+	for _, name := range []string{"report.pdf", "report.docx", "table.xlsx", "slides.pptx", "data.json", "photo.png"} {
+		got := normalizeWikiDocumentKind(wikiNodeItem{
+			NodeID: "file1", Name: name, Type: "FILE", Category: "DOCUMENT",
+		})
+		if got != dingtalkDocumentKindUploadedFile {
+			t.Fatalf("normalizeWikiDocumentKind(%q) = %q, want uploaded_file", name, got)
+		}
+	}
+}
+
+func TestSpreadsheetRangeAddressesRespectDingTalkCellLimit(t *testing.T) {
+	got := spreadsheetRangeAddresses(0, 0)
+	want := []string{"A1:AX600", "A601:AX1000"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("spreadsheetRangeAddresses(0,0) = %#v, want %#v", got, want)
+	}
+	for _, r := range spreadsheetRangeAddresses(1000, 50) {
+		parts := strings.Split(r, ":")
+		if len(parts) != 2 {
+			t.Fatalf("invalid range %q", r)
+		}
+		startRow := rowNumberFromCell(parts[0])
+		endRow := rowNumberFromCell(parts[1])
+		cells := (endRow - startRow + 1) * 50
+		if cells > dingtalkSpreadsheetMaxCellsPerRange {
+			t.Fatalf("range %q has %d cells, exceeds %d", r, cells, dingtalkSpreadsheetMaxCellsPerRange)
+		}
+	}
+}
+
+func TestSheetContentFingerprint_isStableAndContentSensitive(t *testing.T) {
+	one := []byte("# Sheet\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n")
+	if got, want := sheetContentFingerprint(one), sheetContentFingerprint(one); got != want {
+		t.Fatalf("same content fingerprints differ: %q != %q", got, want)
+	}
+	if sheetContentFingerprint(one) == sheetContentFingerprint([]byte("# Sheet\n\n| A | B |\n| --- | --- |\n| 1 | 3 |\n")) {
+		t.Fatal("different sheet content produced the same fingerprint")
+	}
+}
+
+func TestSheetRevisionUnreliable_onlyMatchesNativeSheetWithoutMetadata(t *testing.T) {
+	if !sheetRevisionUnreliable(docRef{kind: dingtalkDocumentKindNativeSheet, revisionReliable: false}) {
+		t.Fatal("native sheet without metadata should require content probing")
+	}
+	if sheetRevisionUnreliable(docRef{kind: dingtalkDocumentKindNativeSheet, revisionReliable: true}) {
+		t.Fatal("native sheet with metadata should use normal revision checks")
+	}
+	if sheetRevisionUnreliable(docRef{kind: dingtalkDocumentKindNativeDoc, revisionReliable: false}) {
+		t.Fatal("native document should not require sheet probing")
+	}
+}
+
+func rowNumberFromCell(cell string) int {
+	row := 0
+	for _, ch := range cell {
+		if ch >= '0' && ch <= '9' {
+			row = row*10 + int(ch-'0')
+		}
+	}
+	return row
+}
+
+func TestFetchIncremental_wikiUploadedFileResolvesAndDownloads(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v2.0/wiki/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiWorkspacesResponse{
+			Workspaces: []wikiWorkspaceItem{{WorkspaceID: "wk1", Name: "Knowledge", RootNodeID: "root1"}},
+		})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listWikiNodesResponse{Nodes: []wikiNodeItem{{
+			NodeID:      "wiki-dentry-uuid",
+			WorkspaceID: "wk1",
+			Name:        "制度.docx",
+			Type:        "FILE",
+			Category:    "DOCUMENT",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}}})
+	})
+	mux.HandleFunc("/v2.0/wiki/nodes/wiki-dentry-uuid", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"node": wikiNodeItem{
+			NodeID:      "wiki-dentry-uuid",
+			WorkspaceID: "wk1",
+			Name:        "制度.docx",
+			Type:        "FILE",
+			Category:    "DOCUMENT",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}})
+	})
+	mux.HandleFunc("/v2.0/doc/dentries/wiki-dentry-uuid/queryDentryId", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, dentryIDByUUIDResponse{DentryUUID: "wiki-dentry-uuid", DentryID: "drive-file1", SpaceID: "drive-sp1"})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/drive-sp1/dentries/drive-file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/file1"})
+	})
+	mux.HandleFunc("/v1.0/doc/documents/drive-file1/content", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("uploaded docx must use storage download, not online doc content")
+	})
+	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("uploaded wiki attachment"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    "key",
+			"app_secret": "secret",
+			"base_url":   srv.URL,
+		},
+		ResourceIDs: []string{makeWikiWorkspaceResourceID("wk1")},
+		Settings: map[string]interface{}{
+			"union_id":      "operator",
+			"dingtalk_type": "wiki",
+		},
+	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental wiki uploaded file: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] != "" {
+		t.Fatalf("expected downloaded attachment, got %+v", items[0].Metadata)
+	}
+	if string(items[0].Content) != "uploaded wiki attachment" {
+		t.Fatalf("downloaded content = %q", string(items[0].Content))
+	}
+}
+
+func TestFetchIncremental_driveUploadedFileIsDownloaded(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/v1.0/oauth2/accessToken", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, oauthTokenResponse{AccessToken: "test-token", ExpireIn: 7200})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, listDentriesResponse{Dentries: []dentryItem{{
+			ID:          "file1",
+			Name:        "上传文件.pdf",
+			Type:        "FILE",
+			Extension:   "pdf",
+			UpdatedTime: "2026-06-01T00:00:00Z",
+		}}})
+	})
+	mux.HandleFunc("/v1.0/storage/spaces/sp1/dentries/file1/downloadInfos/query", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, downloadInfoResponse{DownloadURL: srv.URL + "/download/file1"})
+	})
+	mux.HandleFunc("/download/file1", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("uploaded drive file bytes"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	dsConfig := &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"app_key":    "key",
+			"app_secret": "secret",
+			"union_id":   "operator",
+			"base_url":   srv.URL,
+		},
+		ResourceIDs: []string{makeSpaceResourceID("sp1")},
+	}
+	items, _, err := NewConnector().FetchIncremental(context.Background(), dsConfig, nil)
+	if err != nil {
+		t.Fatalf("FetchIncremental drive uploaded file: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Metadata["error"] != "" || items[0].Metadata["skip_reason"] != "" {
+		t.Fatalf("expected downloaded attachment, got %+v", items[0].Metadata)
+	}
+	if string(items[0].Content) != "uploaded drive file bytes" {
+		t.Fatalf("downloaded content = %q", string(items[0].Content))
+	}
+}
+
+func TestHumanizeDingTalkAPIError_WorkbookPermission(t *testing.T) {
+	got := humanizeDingTalkAPIError(
+		"/v1.0/doc/workbooks/sheet1/sheets",
+		"forbidden",
+		http.StatusForbidden,
+	)
+	for _, want := range []string{"读取钉钉知识库表格工作表失败", "钉钉表格/工作簿读取权限", "UnionID"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error message missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestParseUpdatedTime(t *testing.T) {
+	ts := parseUpdatedTime("2026-07-06T12:00:00Z")
+	if ts.IsZero() {
+		t.Fatal("expected parsed time")
+	}
+	if ts.Year() != 2026 {
+		t.Fatalf("year=%d", ts.Year())
+	}
+	_ = time.UTC
 }
