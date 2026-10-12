@@ -1,7 +1,7 @@
-// Package dingtalk implements the DingTalk document data source connector.
 package dingtalk
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,803 +10,1304 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/Tencent/WeKnora/internal/datasource"
-	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/logger"
 )
 
-const (
-	apiBaseURL       = "https://api.dingtalk.com"
-	apiTimeout       = 30 * time.Second
-	maxResponseBytes = 16 << 20
-	maxPages         = 1000
-	maxAttempts      = 3
+var errEmptyWikiSpreadsheet = errors.New("钉钉在线表格暂无单元格内容")
 
-	// downloadTimeout is deliberately longer than apiTimeout: the JSON calls
-	// are small, while an uploaded document can be several megabytes.
-	downloadTimeout = 5 * time.Minute
+// Client calls DingTalk Open APIs for document storage.
+type Client struct {
+	cfg                *Config
+	httpClient         *http.Client
+	exportPollInterval time.Duration
+	exportMaxPolls     int
 
-	// maxDocumentBytes bounds a single uploaded file transfer. DingTalk lists a
-	// "size" per node that does not match the stored object, so the cap is
-	// enforced on the transfer itself instead of on listing metadata.
-	maxDocumentBytes = 64 << 20
-)
-
-type config struct {
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	OperatorID   string `json:"operator_id"`
+	tokenMu    sync.Mutex
+	tokenCache string
+	tokenExpAt time.Time
 }
 
-func parseConfig(dataSourceConfig *types.DataSourceConfig) (*config, error) {
-	if dataSourceConfig == nil {
-		return nil, fmt.Errorf("%w: config is nil", datasource.ErrInvalidConfig)
-	}
-
-	raw, err := json.Marshal(dataSourceConfig.Credentials)
-	if err != nil {
-		return nil, fmt.Errorf("%w: marshal DingTalk credentials: %v",
-			datasource.ErrInvalidCredentials, err)
-	}
-	var cfg config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("%w: decode DingTalk credentials: %v",
-			datasource.ErrInvalidCredentials, err)
-	}
-	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
-	cfg.ClientSecret = strings.TrimSpace(cfg.ClientSecret)
-	cfg.OperatorID = strings.TrimSpace(cfg.OperatorID)
-
-	switch {
-	case cfg.ClientID == "":
-		return nil, fmt.Errorf("%w: client_id is required", datasource.ErrInvalidCredentials)
-	case cfg.ClientSecret == "":
-		return nil, fmt.Errorf("%w: client_secret is required", datasource.ErrInvalidCredentials)
-	case cfg.OperatorID == "":
-		return nil, fmt.Errorf("%w: operator_id is required", datasource.ErrInvalidCredentials)
-	}
-	return &cfg, nil
-}
-
-type workspace struct {
-	ID           string `json:"workspaceId"`
-	RootNodeID   string `json:"rootNodeId"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	URL          string `json:"url"`
-	ModifiedTime string `json:"modifiedTime"`
-}
-
-type node struct {
-	ID                string `json:"nodeId"`
-	WorkspaceID       string `json:"workspaceId"`
-	Name              string `json:"name"`
-	Type              string `json:"type"`
-	Category          string `json:"category"`
-	Extension         string `json:"extension"`
-	URL               string `json:"url"`
-	ModifiedTime      string `json:"modifiedTime"`
-	ModifiedTimestamp int64  `json:"modifiedTimestamp"`
-	HasChildren       bool   `json:"hasChildren"`
-}
-
-// binaryDocumentTypes maps the extension of an uploaded DingTalk file to the
-// MIME type WeKnora stores it under. Only formats WeKnora can parse are listed;
-// native ALIDOC files have their own online read APIs and are absent on
-// purpose, as are media files that would be pointless to index as text.
-var binaryDocumentTypes = map[string]string{
-	"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-	"pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-	"xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-	"pdf":  "application/pdf",
-}
-
-func (n node) isFolder() bool {
-	return strings.EqualFold(n.Type, "FOLDER")
-}
-
-// isOnlineDocument reports whether the node is a native DingTalk document whose
-// blocks can be read through the doc suites API.
-func (n node) isOnlineDocument() bool {
-	return strings.EqualFold(n.Type, "FILE") &&
-		strings.EqualFold(n.Category, "ALIDOC") &&
-		strings.EqualFold(n.Extension, "adoc")
-}
-
-// binaryContentType returns the MIME type of an uploaded file node. Uploaded
-// files are listed as DOCUMENT; ALIDOC covers DingTalk's own document family,
-// which is never downloaded as a file.
-func (n node) binaryContentType() (string, bool) {
-	if !strings.EqualFold(n.Type, "FILE") || !strings.EqualFold(n.Category, "DOCUMENT") {
-		return "", false
-	}
-	contentType, ok := binaryDocumentTypes[strings.ToLower(strings.TrimSpace(n.Extension))]
-	return contentType, ok
-}
-
-// isBinaryDocument reports whether the node is an uploaded file this connector
-// can download and hand to WeKnora's own parsers.
-func (n node) isBinaryDocument() bool {
-	_, ok := n.binaryContentType()
-	return ok
-}
-
-// isDocument reports whether the connector has a read path for the node at all:
-// a native adoc document through the blocks API, or an uploaded file through
-// the storage download API. Whether a given data source takes it is
-// isIngestible's answer, because an upload is guarded by its own switch.
-func (n node) isDocument() bool {
-	return n.isOnlineDocument() || n.isBinaryDocument()
-}
-
-// isIngestible reports whether this data source ingests the node: a read path
-// must exist and the switch guarding it must be on. Validate, the resource
-// picker and both sync modes select nodes through this one predicate, so a
-// switch that is off is off in every one of them.
-func (n node) isIngestible(settings documentSettings) bool {
-	if n.isOnlineDocument() {
-		return true
-	}
-	return settings.IncludeUploadedFiles && n.isBinaryDocument()
-}
-
-func (n node) title() string {
-	if title := strings.TrimSpace(n.Name); title != "" {
-		return title
-	}
-	return n.ID
-}
-
-func (n node) revision() string {
-	// Prefer the millisecond timestamp when present. Official node listings
-	// also return modifiedTime at minute precision (e.g. 2023-05-15T11:29Z),
-	// which would skip same-minute edits during incremental sync.
-	if n.ModifiedTimestamp > 0 {
-		return strconv.FormatInt(n.ModifiedTimestamp, 10)
-	}
-	return strings.TrimSpace(n.ModifiedTime)
-}
-
-func (n node) modifiedAt() time.Time {
-	if n.ModifiedTimestamp > 0 {
-		return time.UnixMilli(n.ModifiedTimestamp)
-	}
-	return parseDingTalkTime(n.ModifiedTime)
-}
-
-type dingTalkAPI interface {
-	listWorkspaces(context.Context) ([]workspace, error)
-	listNodes(context.Context, string) ([]node, error)
-	listNodesPage(ctx context.Context, parentNodeID, pageToken string) ([]node, string, error)
-	documentBlocks(context.Context, string) ([]json.RawMessage, error)
-	// verifyDocumentDownload proves an uploaded file is downloadable without
-	// transferring its body, so validation stays cheap for multi-megabyte files.
-	verifyDocumentDownload(context.Context, string) error
-	downloadDocument(context.Context, string) ([]byte, error)
-}
-
-type client struct {
-	baseURL   string
-	operator  string
-	appKey    string
-	appSecret string
-	http      *http.Client
-	sleep     func(context.Context, time.Duration) error
-
-	// fileHTTP transfers document bytes. It is separate from http so a large
-	// download is not bound by the short control-plane timeout.
-	fileHTTP *http.Client
-	// downloadLimit overrides maxDocumentBytes; zero means the default.
-	downloadLimit int64
-
-	token       string
-	tokenExpiry time.Time
-}
-
-func newClient(cfg *config) *client {
-	return &client{
-		baseURL:   apiBaseURL,
-		operator:  cfg.OperatorID,
-		appKey:    cfg.ClientID,
-		appSecret: cfg.ClientSecret,
-		http:      datasource.NewConnectorHTTPClient(apiTimeout),
-		fileHTTP:  datasource.NewConnectorHTTPClient(downloadTimeout),
-		sleep:     sleepContext,
+func NewClient(cfg *Config) *Client {
+	return &Client{
+		cfg:                cfg,
+		httpClient:         &http.Client{Timeout: 45 * time.Second},
+		exportPollInterval: 2 * time.Second,
+		exportMaxPolls:     150,
 	}
 }
 
-// transferHTTP returns the client used for byte transfers.
-func (c *client) transferHTTP() *http.Client {
-	if c.fileHTTP != nil {
-		return c.fileHTTP
-	}
-	return c.http
-}
-
-// maxDownloadBytes returns the effective per-document size cap.
-func (c *client) maxDownloadBytes() int64 {
-	if c.downloadLimit > 0 {
-		return c.downloadLimit
-	}
-	return maxDocumentBytes
-}
-
-type accessTokenResponse struct {
-	AccessToken string `json:"accessToken"`
-	ExpireIn    int64  `json:"expireIn"`
-}
-
-func (c *client) accessToken(ctx context.Context) (string, error) {
-	if c.token != "" && time.Now().Before(c.tokenExpiry) {
-		return c.token, nil
-	}
-
-	var response accessTokenResponse
-	err := c.doJSON(ctx, http.MethodPost, "/v1.0/oauth2/accessToken", map[string]string{
-		"appKey":    c.appKey,
-		"appSecret": c.appSecret,
-	}, false, &response)
-	if err != nil {
-		return "", fmt.Errorf("get DingTalk access token: %w", err)
-	}
-	response.AccessToken = strings.TrimSpace(response.AccessToken)
-	if response.AccessToken == "" {
-		return "", fmt.Errorf("%w: DingTalk returned an empty access token", datasource.ErrInvalidCredentials)
-	}
-
-	ttl := time.Duration(response.ExpireIn) * time.Second
-	if ttl <= 0 {
-		ttl = 90 * time.Minute
-	}
-	if ttl > 5*time.Minute {
-		ttl -= 5 * time.Minute
-	}
-	c.token = response.AccessToken
-	c.tokenExpiry = time.Now().Add(ttl)
-	return c.token, nil
-}
-
-func (c *client) doJSON(
-	ctx context.Context,
-	method, path string,
-	requestBody any,
-	authenticated bool,
-	result any,
-) error {
-	var payload []byte
-	var err error
-	if requestBody != nil {
-		payload, err = json.Marshal(requestBody)
-		if err != nil {
-			return fmt.Errorf("encode DingTalk request: %w", err)
-		}
-	}
-
-	refreshed := false
-	retryAttempt := 0
-	for {
-		var body io.Reader
-		if payload != nil {
-			body = bytes.NewReader(payload)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-		if err != nil {
-			return fmt.Errorf("create DingTalk request: %w", err)
-		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-
-		var token string
-		if authenticated {
-			token, err = c.accessToken(ctx)
-			if err != nil {
-				return err
-			}
-			req.Header.Set("x-acs-dingtalk-access-token", token)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			requestErr := redactRequestError(err)
-			if retryAttempt+1 < maxAttempts && !isContextError(requestErr) {
-				delay := retryDelay(retryAttempt)
-				retryAttempt++
-				if err := c.wait(ctx, delay); err != nil {
-					return err
-				}
-				continue
-			}
-			return fmt.Errorf("execute DingTalk request: %w", requestErr)
-		}
-
-		responseBody, readErr := readBody(resp.Body)
-		_ = resp.Body.Close()
-		if readErr != nil {
-			return fmt.Errorf("read DingTalk response: %w", readErr)
-		}
-
-		if authenticated && resp.StatusCode == http.StatusUnauthorized && !refreshed {
-			if c.token == token {
-				c.token = ""
-				c.tokenExpiry = time.Time{}
-			}
-			refreshed = true
-			continue
-		}
-
-		if isTransient(resp.StatusCode) {
-			apiErr := c.redactAPIError(decodeAPIError(resp.StatusCode, responseBody))
-			if retryAttempt+1 < maxAttempts {
-				delay := retryDelay(retryAttempt)
-				if resp.StatusCode == http.StatusTooManyRequests {
-					delay = parseRetryAfter(resp.Header.Get("Retry-After"), delay)
-				}
-				retryAttempt++
-				if err := c.wait(ctx, delay); err != nil {
-					return err
-				}
-				continue
-			}
-			return apiErr
-		}
-
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			apiErr := c.redactAPIError(decodeAPIError(resp.StatusCode, responseBody))
-			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-				return fmt.Errorf("%w: %w", datasource.ErrInvalidCredentials, apiErr)
-			}
-			return apiErr
-		}
-		if result != nil && len(responseBody) > 0 {
-			if err := json.Unmarshal(responseBody, result); err != nil {
-				return fmt.Errorf("decode DingTalk response: %w", err)
-			}
-		}
-		return nil
-	}
-}
-
-func (c *client) redactAPIError(err error) error {
-	message := err.Error()
-	for _, sensitive := range []string{c.appKey, c.appSecret, c.operator, c.token} {
-		if sensitive != "" {
-			message = strings.ReplaceAll(message, sensitive, "[REDACTED]")
-		}
-	}
-	return errors.New(message)
-}
-
-func (c *client) listWorkspaces(ctx context.Context) ([]workspace, error) {
-	var all []workspace
-	nextToken := ""
-	seenTokens := make(map[string]struct{})
-
-	for page := 0; page < maxPages; page++ {
-		query := url.Values{
-			"maxResults": {"30"},
-			"operatorId": {c.operator},
-		}
-		if nextToken != "" {
-			query.Set("nextToken", nextToken)
-		}
-		var response struct {
-			Workspaces []workspace `json:"workspaces"`
-			NextToken  string      `json:"nextToken"`
-		}
-		if err := c.doJSON(
-			ctx, http.MethodGet, "/v2.0/wiki/workspaces?"+query.Encode(), nil, true, &response,
-		); err != nil {
-			return nil, fmt.Errorf("list DingTalk workspaces: %w", err)
-		}
-		all = append(all, response.Workspaces...)
-		nextToken = strings.TrimSpace(response.NextToken)
-		if nextToken == "" {
-			return all, nil
-		}
-		if _, exists := seenTokens[nextToken]; exists {
-			return nil, errors.New("DingTalk workspace pagination repeated nextToken")
-		}
-		seenTokens[nextToken] = struct{}{}
-	}
-	return nil, fmt.Errorf("DingTalk workspace pagination exceeded %d pages", maxPages)
-}
-
-func (c *client) listNodes(ctx context.Context, parentNodeID string) ([]node, error) {
-	var all []node
-	nextToken := ""
-	seenTokens := make(map[string]struct{})
-
-	for page := 0; page < maxPages; page++ {
-		nodes, next, err := c.listNodesPage(ctx, parentNodeID, nextToken)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, nodes...)
-		nextToken = next
-		if nextToken == "" {
-			return all, nil
-		}
-		if _, exists := seenTokens[nextToken]; exists {
-			return nil, errors.New("DingTalk node pagination repeated nextToken")
-		}
-		seenTokens[nextToken] = struct{}{}
-	}
-	return nil, fmt.Errorf("DingTalk node pagination exceeded %d pages", maxPages)
-}
-
-// listNodesPage requests a single page of children, so one call is one HTTP
-// request plus the client's own retries. An empty next token marks the last
-// page.
-func (c *client) listNodesPage(ctx context.Context, parentNodeID, pageToken string) ([]node, string, error) {
-	query := url.Values{
-		"maxResults":   {"50"},
-		"operatorId":   {c.operator},
-		"parentNodeId": {parentNodeID},
-	}
-	if pageToken != "" {
-		query.Set("nextToken", pageToken)
-	}
-	var response struct {
-		Nodes     []node `json:"nodes"`
-		NextToken string `json:"nextToken"`
-	}
-	if err := c.doJSON(
-		ctx, http.MethodGet, "/v2.0/wiki/nodes?"+query.Encode(), nil, true, &response,
-	); err != nil {
-		return nil, "", fmt.Errorf("list DingTalk nodes: %w", err)
-	}
-	return response.Nodes, strings.TrimSpace(response.NextToken), nil
-}
-
-func (c *client) documentBlocks(ctx context.Context, documentID string) ([]json.RawMessage, error) {
-	const pageSize = 100
-	var all []json.RawMessage
-
-	for page := 0; page < maxPages; page++ {
-		start := page * pageSize
-		query := url.Values{
-			"endIndex":   {strconv.Itoa(start + pageSize - 1)},
-			"operatorId": {c.operator},
-			"startIndex": {strconv.Itoa(start)},
-		}
-		var response struct {
-			Success *bool `json:"success"`
-			Result  *struct {
-				Data []json.RawMessage `json:"data"`
-			} `json:"result"`
-		}
-		path := "/v1.0/doc/suites/documents/" + url.PathEscape(documentID) +
-			"/blocks?" + query.Encode()
-		if err := c.doJSON(ctx, http.MethodGet, path, nil, true, &response); err != nil {
-			return nil, fmt.Errorf("query DingTalk document blocks: %w", err)
-		}
-		if response.Success == nil || !*response.Success || response.Result == nil {
-			return nil, errors.New("DingTalk document blocks request was unsuccessful")
-		}
-		all = append(all, response.Result.Data...)
-		if len(response.Result.Data) < pageSize {
-			return all, nil
-		}
-	}
-	return nil, fmt.Errorf("DingTalk document block pagination exceeded %d pages", maxPages)
-}
-
-// dentryRef identifies one file inside 钉盘. Wiki node IDs are UUIDs, but the
-// storage APIs accept only the numeric spaceId/dentryId pair, so every upload
-// is translated first. Response shape:
-//
-//	{"dentryId":"<numeric>","spaceId":"<numeric>","dentryUuid":"<uuid>"}
-type dentryRef struct {
-	DentryID   string `json:"dentryId"`
-	SpaceID    string `json:"spaceId"`
-	DentryUUID string `json:"dentryUuid"`
-}
-
-// resolveDentry maps a wiki node UUID to its 钉盘 storage identifiers.
-func (c *client) resolveDentry(ctx context.Context, documentID string) (dentryRef, error) {
-	query := url.Values{"operatorId": {c.operator}}
-	path := "/v2.0/doc/dentries/" + url.PathEscape(documentID) +
-		"/queryDentryId?" + query.Encode()
-
-	var ref dentryRef
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, true, &ref); err != nil {
-		return dentryRef{}, fmt.Errorf("resolve DingTalk document location: %w", err)
-	}
-	ref.DentryID = strings.TrimSpace(ref.DentryID)
-	ref.SpaceID = strings.TrimSpace(ref.SpaceID)
-	if ref.DentryID == "" || ref.SpaceID == "" {
-		return dentryRef{}, errors.New("DingTalk returned no storage location for the document")
-	}
-	return ref, nil
-}
-
-// downloadTarget is a short-lived pre-signed URL for one document version.
-type downloadTarget struct {
-	URL     string
-	Headers map[string]string
-}
-
-type downloadInfoResponse struct {
-	Protocol            string `json:"protocol"`
-	HeaderSignatureInfo *struct {
-		Headers           map[string]string `json:"headers"`
-		ResourceURLs      []string          `json:"resourceUrls"`
-		ExpirationSeconds int64             `json:"expirationSeconds"`
-	} `json:"headerSignatureInfo"`
-}
-
-// requestDownloadURL asks the storage API for a pre-signed download URL.
-// preferIntranet stays false so the URL is reachable from outside DingTalk's
-// own network.
-func (c *client) requestDownloadURL(ctx context.Context, ref dentryRef) (downloadTarget, error) {
-	query := url.Values{"unionId": {c.operator}}
-	path := "/v1.0/storage/spaces/" + url.PathEscape(ref.SpaceID) +
-		"/dentries/" + url.PathEscape(ref.DentryID) + "/downloadInfos/query?" + query.Encode()
-	body := map[string]interface{}{
-		"option": map[string]interface{}{"version": 1, "preferIntranet": false},
-	}
-
-	var response downloadInfoResponse
-	if err := c.doJSON(ctx, http.MethodPost, path, body, true, &response); err != nil {
-		return downloadTarget{}, fmt.Errorf("query DingTalk download URL: %w", err)
-	}
-	info := response.HeaderSignatureInfo
-	if info == nil || len(info.ResourceURLs) == 0 {
-		return downloadTarget{}, fmt.Errorf(
-			"DingTalk returned no download URL for the document (protocol %q)",
-			strings.TrimSpace(response.Protocol))
-	}
-	target := downloadTarget{
-		URL:     strings.TrimSpace(info.ResourceURLs[0]),
-		Headers: info.Headers,
-	}
-	if target.URL == "" {
-		return downloadTarget{}, errors.New("DingTalk returned an empty download URL")
-	}
-	return target, nil
-}
-
-// verifyDocumentDownload proves an uploaded file is reachable end to end
-// without transferring its body: the node must resolve to a storage location
-// and yield a pre-signed URL. Validate uses this so credentials can be checked
-// without downloading several megabytes per attempt.
-func (c *client) verifyDocumentDownload(ctx context.Context, documentID string) error {
-	ref, err := c.resolveDentry(ctx, documentID)
-	if err != nil {
-		return err
-	}
-	_, err = c.requestDownloadURL(ctx, ref)
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.getAccessToken(ctx)
 	return err
 }
 
-// downloadDocument fetches the raw bytes of an uploaded document. The pre-signed
-// URL is versioned and short lived, so it is re-requested whenever a transfer
-// attempt fails in a way a fresh signature could fix.
-func (c *client) downloadDocument(ctx context.Context, documentID string) ([]byte, error) {
-	ref, err := c.resolveDentry(ctx, documentID)
-	if err != nil {
-		return nil, err
+func (c *Client) getAccessToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
+	if c.tokenCache != "" && time.Now().Before(c.tokenExpAt) {
+		return c.tokenCache, nil
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			if err := c.wait(ctx, retryDelay(attempt-1)); err != nil {
-				return nil, err
-			}
-		}
-		target, err := c.requestDownloadURL(ctx, ref)
+	// Prefer api.dingtalk.com OAuth2 client_credentials when available.
+	token, ttl, err := c.fetchOAuthToken(ctx)
+	if err != nil {
+		logger.Warnf(ctx, "[DingTalk] oauth token failed, trying legacy gettoken: %v", err)
+		token, ttl, err = c.fetchLegacyToken(ctx)
 		if err != nil {
-			return nil, err
-		}
-		data, retryable, err := c.fetchSigned(ctx, target)
-		if err == nil {
-			return data, nil
-		}
-		lastErr = err
-		if !retryable || isContextError(err) {
-			return nil, err
+			return "", err
 		}
 	}
-	return nil, lastErr
+
+	c.tokenCache = token
+	if ttl > 5*time.Minute {
+		ttl -= 5 * time.Minute
+	} else if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	c.tokenExpAt = time.Now().Add(ttl)
+	return c.tokenCache, nil
 }
 
-// fetchSigned transfers a document body from a pre-signed URL. It reports
-// whether the failure is worth retrying with a freshly signed URL.
-func (c *client) fetchSigned(ctx context.Context, target downloadTarget) ([]byte, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.URL, nil)
+func (c *Client) fetchOAuthToken(ctx context.Context) (string, time.Duration, error) {
+	u := c.cfg.GetAPIBase() + "/v1.0/oauth2/accessToken"
+	body, _ := json.Marshal(map[string]string{
+		"appKey":    c.cfg.AppKey,
+		"appSecret": c.cfg.AppSecret,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
-		return nil, false, fmt.Errorf("create DingTalk download request: %w", err)
+		return "", 0, err
 	}
-	for name, value := range target.Headers {
-		req.Header.Set(name, value)
-	}
-	// The signature covers the object as stored. Asking for an identity
-	// encoding keeps a proxy from re-encoding the bytes into an unparseable
-	// document.
-	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.transferHTTP().Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, true, fmt.Errorf("download DingTalk document: %w", redactRequestError(err))
+		return "", 0, fmt.Errorf("oauth token request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		// Object-store failures are small XML bodies. Only a bounded prefix is
-		// read, and decodeAPIError never echoes the body verbatim.
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		retryable := isTransient(resp.StatusCode) ||
-			resp.StatusCode == http.StatusUnauthorized ||
-			resp.StatusCode == http.StatusForbidden ||
-			resp.StatusCode == http.StatusNotFound
-		return nil, retryable, fmt.Errorf(
-			"download DingTalk document: %w", decodeAPIError(resp.StatusCode, detail))
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
+		return "", 0, fmt.Errorf("oauth endpoint unavailable: status=%d", resp.StatusCode)
 	}
 
-	limit := c.maxDownloadBytes()
-	if resp.ContentLength > limit {
-		return nil, false, fmt.Errorf(
-			"%w: %d bytes announced, limit is %d bytes",
-			errDocumentTooLarge, resp.ContentLength, limit)
+	var out oauthTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", 0, fmt.Errorf("decode oauth token: %w", err)
 	}
-	data, err := readLimited(resp.Body, limit)
+	if out.AccessToken == "" {
+		return "", 0, fmt.Errorf("empty oauth access token")
+	}
+	sec := out.ExpireIn
+	if sec <= 0 {
+		sec = 7200
+	}
+	return out.AccessToken, time.Duration(sec) * time.Second, nil
+}
+
+func (c *Client) fetchLegacyToken(ctx context.Context) (string, time.Duration, error) {
+	q := url.Values{}
+	q.Set("appkey", c.cfg.AppKey)
+	q.Set("appsecret", c.cfg.AppSecret)
+	u := c.cfg.GetLegacyBase() + "/gettoken?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		if errors.Is(err, errDocumentTooLarge) {
-			return nil, false, fmt.Errorf("download DingTalk document: %w", err)
-		}
-		return nil, true, fmt.Errorf("read DingTalk document: %w", err)
+		return "", 0, err
 	}
-	return data, false, nil
-}
-
-// errDocumentTooLarge marks a document whose transfer passed the configured
-// size cap. The size is a property of the stored object rather than a transient
-// failure — a freshly signed URL returns the very same bytes — so a caller must
-// not retry it.
-var errDocumentTooLarge = errors.New("document exceeds the download limit")
-
-// readLimited reads at most limit bytes and fails when the body is longer, so
-// an over-sized document is reported instead of silently truncated. The failure
-// wraps errDocumentTooLarge so the streaming guard and the announced-length
-// guard report the same, recognisable error.
-func readLimited(body io.Reader, limit int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return "", 0, fmt.Errorf("legacy gettoken: %w", err)
 	}
-	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("%w of %d bytes", errDocumentTooLarge, limit)
+	defer resp.Body.Close()
+
+	var out legacyTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", 0, fmt.Errorf("decode legacy token: %w", err)
 	}
-	return data, nil
+	if out.ErrCode != 0 {
+		return "", 0, fmt.Errorf("dingtalk gettoken errcode=%d errmsg=%s", out.ErrCode, out.ErrMsg)
+	}
+	sec := out.ExpiresIn
+	if sec <= 0 {
+		sec = 7200
+	}
+	return out.AccessToken, time.Duration(sec) * time.Second, nil
 }
 
-type apiError struct {
-	status  int
-	code    string
-	message string
-}
-
-func (e *apiError) Error() string {
-	switch {
-	case e.code != "" && e.message != "":
-		return fmt.Sprintf("DingTalk API status=%d code=%s message=%s", e.status, e.code, e.message)
-	case e.code != "":
-		return fmt.Sprintf("DingTalk API status=%d code=%s", e.status, e.code)
-	default:
-		return fmt.Sprintf("DingTalk API status=%d", e.status)
-	}
-}
-
-func decodeAPIError(status int, body []byte) error {
-	var response struct {
-		Code    json.RawMessage `json:"code"`
-		ErrCode json.RawMessage `json:"errcode"`
-		Message string          `json:"message"`
-		ErrMsg  string          `json:"errmsg"`
-	}
-	_ = json.Unmarshal(body, &response)
-	code := rawValue(response.Code)
-	if code == "" {
-		code = rawValue(response.ErrCode)
-	}
-	message := strings.TrimSpace(response.Message)
-	if message == "" {
-		message = strings.TrimSpace(response.ErrMsg)
-	}
-	return &apiError{status: status, code: code, message: message}
-}
-
-func rawValue(value json.RawMessage) string {
-	if len(value) == 0 || string(value) == "null" {
-		return ""
-	}
-	var text string
-	if err := json.Unmarshal(value, &text); err == nil {
-		return strings.TrimSpace(text)
-	}
-	return strings.TrimSpace(string(value))
-}
-
-func readBody(body io.Reader) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+func (c *Client) doAPI(ctx context.Context, method, path string, query url.Values, body interface{}, result interface{}) error {
+	token, err := c.getAccessToken(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if len(data) > maxResponseBytes {
-		return nil, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
-	}
-	return data, nil
-}
 
-func isTransient(status int) bool {
-	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
-}
-
-func retryDelay(attempt int) time.Duration {
-	if attempt < 0 {
-		attempt = 0
+	full := c.cfg.GetAPIBase() + path
+	requestTarget := path
+	if len(query) > 0 {
+		encodedQuery := query.Encode()
+		full += "?" + encodedQuery
+		requestTarget += "?" + encodedQuery
 	}
-	if attempt > 4 {
-		attempt = 4
-	}
-	return time.Duration(1<<attempt) * 250 * time.Millisecond
-}
 
-func parseRetryAfter(value string, fallback time.Duration) time.Duration {
-	const maximum = 30 * time.Second
-	delay := fallback
-	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && value != "" {
-		if seconds <= 0 {
-			delay = 100 * time.Millisecond
-		} else {
-			delay = time.Duration(seconds) * time.Second
-		}
-	} else if parsed, err := http.ParseTime(value); err == nil {
-		delay = time.Until(parsed)
-		if delay <= 0 {
-			delay = 100 * time.Millisecond
-		}
-	}
-	if delay > maximum {
-		return maximum
-	}
-	return delay
-}
-
-func (c *client) wait(ctx context.Context, delay time.Duration) error {
-	if c.sleep == nil {
-		return sleepContext(ctx, delay)
-	}
-	return c.sleep(ctx, delay)
-}
-
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func isContextError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-func redactRequestError(err error) error {
-	for {
-		var requestErr *url.Error
-		if !errors.As(err, &requestErr) || requestErr.Err == nil {
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
 			return err
 		}
-		// url.Error includes the full request URL. DingTalk puts operatorId in
-		// the query string, so retain the cause without persisting that ID.
-		err = requestErr.Err
+		bodyReader = bytes.NewReader(b)
 	}
+
+	req, err := http.NewRequestWithContext(ctx, method, full, bodyReader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	logger.Infof(ctx, "[DingTalk] %s %s", method, requestTarget)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		var apiErr apiErrorBody
+		_ = json.Unmarshal(raw, &apiErr)
+		detail := formatDingTalkAPIErrorDetail(apiErr, raw)
+		logger.Warnf(ctx, "[DingTalk] %s %s failed: status=%d body=%s", method, requestTarget, resp.StatusCode, truncate(string(raw), 500))
+		if detail != "" {
+			return fmt.Errorf("%s", humanizeDingTalkAPIError(path, detail, resp.StatusCode))
+		}
+		return fmt.Errorf("%s", humanizeDingTalkAPIError(path, truncate(string(raw), 200), resp.StatusCode))
+	}
+	if result == nil {
+		return nil
+	}
+	if err := json.Unmarshal(raw, result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) ListSpaces(ctx context.Context) ([]spaceItem, error) {
+	var all []spaceItem
+	next := ""
+	for {
+		q := url.Values{}
+		q.Set("unionId", c.cfg.OperatorUnionID)
+		q.Set("spaceType", "org")
+		q.Set("maxResults", "50")
+		if next != "" {
+			q.Set("nextToken", next)
+		}
+		var out listSpacesResponse
+		if err := c.doAPI(ctx, http.MethodGet, "/v1.0/drive/spaces", q, nil, &out); err != nil {
+			return nil, fmt.Errorf("list spaces: %w", err)
+		}
+		all = append(all, out.normalizedSpaces()...)
+		if out.NextToken == "" {
+			break
+		}
+		next = out.NextToken
+	}
+	return all, nil
+}
+
+func (c *Client) ListDentries(ctx context.Context, spaceID, parentID, cursor string) ([]dentryItem, string, error) {
+	q := url.Values{}
+	q.Set("unionId", c.cfg.OperatorUnionID)
+	if parentID != "" {
+		q.Set("parentId", parentID)
+	} else {
+		q.Set("parentId", "0")
+	}
+	if cursor != "" {
+		q.Set("nextToken", cursor)
+	}
+	var out listDentriesResponse
+	if err := c.doAPI(ctx, http.MethodGet, "/v1.0/storage/spaces/"+url.PathEscape(spaceID)+"/dentries", q, nil, &out); err != nil {
+		return nil, "", err
+	}
+	return out.normalizedDentries(), out.normalizedNextToken(), nil
+}
+
+func (c *Client) ListWikiWorkspaces(ctx context.Context) ([]wikiWorkspaceItem, error) {
+	var all []wikiWorkspaceItem
+	next := ""
+	for {
+		q := url.Values{}
+		q.Set("operatorId", c.cfg.OperatorUnionID)
+		q.Set("maxResults", "50")
+		if next != "" {
+			q.Set("nextToken", next)
+		}
+		var out listWikiWorkspacesResponse
+		if err := c.doAPI(ctx, http.MethodGet, "/v2.0/wiki/workspaces", q, nil, &out); err != nil {
+			return nil, fmt.Errorf("list wiki workspaces: %w", err)
+		}
+		all = append(all, out.normalizedWorkspaces()...)
+		if out.NextToken == "" {
+			break
+		}
+		next = out.NextToken
+	}
+	return all, nil
+}
+
+func (c *Client) ListWikiNodes(ctx context.Context, parentNodeID, cursor string) ([]wikiNodeItem, string, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	q.Set("parentNodeId", parentNodeID)
+	q.Set("maxResults", "50")
+	if cursor != "" {
+		q.Set("nextToken", cursor)
+	}
+	var out listWikiNodesResponse
+	if err := c.doAPI(ctx, http.MethodGet, "/v2.0/wiki/nodes", q, nil, &out); err != nil {
+		return nil, "", fmt.Errorf("list wiki nodes: %w", err)
+	}
+	return out.normalizedNodes(), out.NextToken, nil
+}
+
+func (c *Client) GetWikiNode(ctx context.Context, nodeID string) (*wikiNodeItem, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	var out struct {
+		Node wikiNodeItem `json:"node"`
+	}
+	if err := c.doAPI(ctx, http.MethodGet, "/v2.0/wiki/nodes/"+url.PathEscape(nodeID), q, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Node.NodeID == "" {
+		out.Node.NodeID = nodeID
+	}
+	return &out.Node, nil
+}
+
+func (c *Client) ResolveDentryIDByUUID(ctx context.Context, dentryUUID string) (*dentryIDByUUIDResponse, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	path := "/v2.0/doc/dentries/" + url.PathEscape(dentryUUID) + "/queryDentryId"
+	var out dentryIDByUUIDResponse
+	if err := c.doAPI(ctx, http.MethodGet, path, q, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.SpaceID == "" || out.DentryID == "" {
+		return nil, fmt.Errorf("钉钉未返回可下载文件的 spaceId/dentryId")
+	}
+	if out.DentryUUID == "" {
+		out.DentryUUID = dentryUUID
+	}
+	return &out, nil
+}
+
+// GetDentry returns metadata for a single dentry (used to walk parent chain in the resource picker).
+func (c *Client) GetDentry(ctx context.Context, spaceID, dentryID string) (*dentryItem, error) {
+	path := fmt.Sprintf("/v1.0/storage/spaces/%s/dentries/%s",
+		url.PathEscape(spaceID), url.PathEscape(dentryID))
+	q := url.Values{}
+	q.Set("unionId", c.cfg.OperatorUnionID)
+	var out dentryItem
+	if err := c.doAPI(ctx, http.MethodGet, path, q, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.ID == "" {
+		out.ID = dentryID
+	}
+	if out.SpaceID == "" {
+		out.SpaceID = spaceID
+	}
+	return &out, nil
+}
+
+// DownloadDocContent exports or downloads document bytes for an online doc dentry.
+// Implementation uses storage download when available; tests can stub via httptest.
+func (c *Client) DownloadDocContent(ctx context.Context, spaceID, dentryID, name, extension string) ([]byte, string, error) {
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if isDriveNativeOnlineDocExtension(extension) {
+		return c.downloadViaExportFallback(ctx, token, spaceID, dentryID, name, extension, nil)
+	}
+
+	return c.downloadUploadedFileContentWithToken(ctx, token, spaceID, dentryID, name, extension)
+}
+
+// DownloadUploadedFileContent downloads a file stored as an attachment in a
+// DingTalk knowledge-base node. Attachments must use the storage download API
+// even when their extension is docx/xlsx; they are not online documents.
+func (c *Client) DownloadUploadedFileContent(ctx context.Context, spaceID, dentryID, name, extension string) ([]byte, string, error) {
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return c.downloadUploadedFileContentWithToken(ctx, token, spaceID, dentryID, name, extension)
+}
+
+func (c *Client) downloadUploadedFileContentWithToken(ctx context.Context, token, spaceID, dentryID, name, extension string) ([]byte, string, error) {
+	// Try the current download-info API first, then GET URL with returned headers.
+	path := fmt.Sprintf("/v1.0/storage/spaces/%s/dentries/%s/downloadInfos",
+		url.PathEscape(spaceID), url.PathEscape(dentryID))
+	data, err := c.downloadStorageFile(ctx, token, path+"/query", name, extension)
+	if err == nil {
+		return data, pickFileName(name, extension, "docx"), nil
+	}
+
+	// Backward compatibility for older/private deployments that still expose
+	// /downloadInfos without the /query suffix.
+	var legacyErr error
+	if data, legacyErr = c.downloadStorageFile(ctx, token, path, name, extension); legacyErr == nil {
+		return data, pickFileName(name, extension, "docx"), nil
+	}
+
+	return nil, "", fmt.Errorf("读取钉钉上传文件下载信息失败：%v（兼容旧接口也失败：%v）", err, legacyErr)
+}
+
+func (c *Client) downloadStorageFile(ctx context.Context, token, path, name, extension string) ([]byte, error) {
+	q := url.Values{}
+	q.Set("unionId", c.cfg.OperatorUnionID)
+	reqBody := map[string]interface{}{
+		"option": map[string]interface{}{
+			"preferIntranet": false,
+		},
+	}
+	var downloadResp downloadInfoResponse
+	if err := c.doAPI(ctx, http.MethodPost, path, q, reqBody, &downloadResp); err != nil {
+		return nil, err
+	}
+	downloadURL, headers := firstDownloadURLAndHeaders(downloadResp)
+	if downloadURL == "" {
+		return nil, fmt.Errorf("钉钉未返回文件下载地址")
+	}
+
+	if !c.isAllowedDownloadHost(downloadURL) {
+		return nil, fmt.Errorf("download url host not allowed")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+	for k, v := range headers {
+		if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("下载钉钉文件失败：HTTP %d %s", resp.StatusCode, truncate(string(body), 200))
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func firstDownloadURLAndHeaders(resp downloadInfoResponse) (string, map[string]string) {
+	if resp.DownloadURL != "" {
+		return resp.DownloadURL, resp.Headers
+	}
+	if len(resp.ResourceURLs) > 0 {
+		return resp.ResourceURLs[0], resp.Headers
+	}
+	if len(resp.HeaderSignatureInfo.ResourceURLs) > 0 {
+		return resp.HeaderSignatureInfo.ResourceURLs[0], resp.HeaderSignatureInfo.Headers
+	}
+	if len(resp.HeaderSignatureInfo.InternalResourceURLs) > 0 {
+		return resp.HeaderSignatureInfo.InternalResourceURLs[0], resp.HeaderSignatureInfo.Headers
+	}
+	return "", nil
+}
+
+func (c *Client) downloadViaExportFallback(ctx context.Context, token, spaceID, dentryID, name, extension string, prev error) ([]byte, string, error) {
+	// Minimal fallback: raw content endpoint used in some DingTalk doc versions.
+	path := fmt.Sprintf("/v1.0/doc/documents/%s/content", url.PathEscape(dentryID))
+	var contentResp struct {
+		Content string `json:"content"`
+	}
+	if err := c.doAPI(ctx, http.MethodGet, path, nil, nil, &contentResp); err != nil {
+		return nil, "", fmt.Errorf("download doc: %w (also: %v)", err, prev)
+	}
+	if contentResp.Content == "" {
+		return nil, "", fmt.Errorf("empty doc content: %v", prev)
+	}
+	fileName := markdownFileName(name)
+	return []byte(contentResp.Content), fileName, nil
+}
+
+func (c *Client) DownloadWikiDocContent(ctx context.Context, docKey, name, extension string) ([]byte, string, error) {
+	return c.exportWikiDocAsDOCX(ctx, docKey, name)
+}
+
+func (c *Client) submitDocumentExport(ctx context.Context, dentryUUID string) (*submitExportJobResponse, error) {
+	var out submitExportJobResponse
+	err := c.doAPI(ctx, http.MethodPost, "/v2.0/doc/me/export/submit", nil, submitExportJobRequest{
+		DentryUUID:   dentryUUID,
+		OperatorID:   c.cfg.OperatorUnionID,
+		TargetFormat: "docx",
+	}, &out)
+	if err != nil {
+		return nil, err
+	}
+	if out.DownloadURL == "" && out.TaskID == "" {
+		return nil, fmt.Errorf("钉钉未返回导出任务 ID 或下载地址")
+	}
+	return &out, nil
+}
+
+func (c *Client) queryDocumentExport(ctx context.Context, taskID string) (*queryExportTaskResponse, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	q.Set("taskId", taskID)
+	var out queryExportTaskResponse
+	if err := c.doAPI(ctx, http.MethodGet, "/v2.0/doc/me/export/task/query", q, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) pollDocumentExport(ctx context.Context, taskID string) (string, error) {
+	for attempt := 0; attempt < c.exportMaxPolls; attempt++ {
+		if c.exportPollInterval > 0 {
+			timer := time.NewTimer(c.exportPollInterval)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return "", fmt.Errorf("钉钉文档导出轮询被取消：taskId=%s: %w", taskID, ctx.Err())
+			case <-timer.C:
+			}
+		}
+		result, err := c.queryDocumentExport(ctx, taskID)
+		if err != nil {
+			return "", fmt.Errorf("查询钉钉文档导出任务失败：taskId=%s: %w", taskID, err)
+		}
+		status := strings.ToUpper(strings.TrimSpace(result.Status))
+		switch status {
+		case "SUCCESS":
+			if result.DownloadURL == "" {
+				return "", fmt.Errorf("钉钉文档导出成功但 downloadUrl 为空：taskId=%s", taskID)
+			}
+			return result.DownloadURL, nil
+		case "PROCESSING":
+			continue
+		default:
+			return "", fmt.Errorf("钉钉文档导出任务失败：taskId=%s status=%s", taskID, result.Status)
+		}
+	}
+	return "", fmt.Errorf("钉钉文档导出任务超时：taskId=%s，已轮询 %d 次", taskID, c.exportMaxPolls)
+}
+
+func (c *Client) exportWikiDocAsDOCX(ctx context.Context, dentryUUID, name string) ([]byte, string, error) {
+	result, err := c.submitDocumentExport(ctx, dentryUUID)
+	if err != nil {
+		wrapped := fmt.Errorf("提交钉钉文档导出任务失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q stage=submit_export error=%v", name, dentryUUID, wrapped)
+		return nil, "", wrapped
+	}
+	if result.DownloadURL == "" {
+		result.DownloadURL, err = c.pollDocumentExport(ctx, result.TaskID)
+		if err != nil {
+			logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q taskId=%q stage=poll_export error=%v", name, dentryUUID, result.TaskID, err)
+			return nil, "", err
+		}
+	}
+	data, err := c.downloadExportFile(ctx, result.DownloadURL)
+	if err != nil {
+		wrapped := fmt.Errorf("下载钉钉文档导出结果失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q taskId=%q stage=download_export error=%v", name, dentryUUID, result.TaskID, wrapped)
+		return nil, "", wrapped
+	}
+	if err := validateDOCX(data); err != nil {
+		wrapped := fmt.Errorf("校验钉钉文档导出结果失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document export failed: name=%q dentryUuid=%q taskId=%q stage=validate_docx error=%v", name, dentryUUID, result.TaskID, wrapped)
+		return nil, "", wrapped
+	}
+	return data, documentFileName(name, "docx"), nil
+}
+
+func (c *Client) downloadExportFile(ctx context.Context, rawURL string) ([]byte, error) {
+	if !c.isAllowedDownloadHost(rawURL) {
+		return nil, fmt.Errorf("download url host not allowed")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("下载钉钉导出文件失败：HTTP %d %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	return data, nil
+}
+
+func (c *Client) downloadWikiDocBinary(ctx context.Context, docKey, name string) ([]byte, string, error) {
+	info, err := c.ResolveDentryIDByUUID(ctx, docKey)
+	if err != nil {
+		wrapped := fmt.Errorf("解析钉钉文档下载标识失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=resolve_dentry error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		wrapped := fmt.Errorf("获取钉钉文档下载凭证失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=access_token error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	path := fmt.Sprintf("/v1.0/storage/spaces/%s/dentries/%s/downloadInfos/query",
+		url.PathEscape(info.SpaceID), url.PathEscape(info.DentryID))
+	data, err := c.downloadStorageFile(ctx, token, path, name, "docx")
+	if err != nil {
+		wrapped := fmt.Errorf("下载钉钉完整文档失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=download_file error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	if err := validateDOCX(data); err != nil {
+		wrapped := fmt.Errorf("校验钉钉完整文档失败：%w", err)
+		logger.Warnf(ctx, "[DingTalk] wiki document binary download failed: name=%q docKey=%q stage=validate_docx error=%v", name, docKey, wrapped)
+		return nil, "", wrapped
+	}
+	return data, documentFileName(name, "docx"), nil
+}
+
+func validateDOCX(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("下载内容为空")
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("下载内容不是有效的 DOCX/ZIP：%w", err)
+	}
+	hasContentTypes := false
+	hasDocument := false
+	for _, file := range zr.File {
+		switch file.Name {
+		case "[Content_Types].xml":
+			hasContentTypes = true
+		case "word/document.xml":
+			hasDocument = true
+		}
+	}
+	if !hasContentTypes || !hasDocument {
+		return fmt.Errorf("下载的 ZIP 缺少 DOCX 必需文件")
+	}
+	return nil
+}
+
+func (c *Client) downloadWikiDocViaBlocks(ctx context.Context, docKey, name string) ([]byte, string, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	path := fmt.Sprintf("/v1.0/doc/suites/documents/%s/blocks", url.PathEscape(docKey))
+	var out map[string]interface{}
+	if err := c.doAPI(ctx, http.MethodGet, path, q, nil, &out); err != nil {
+		return nil, "", err
+	}
+	content := strings.TrimSpace(extractDingTalkBlockText(out))
+	if content == "" {
+		return nil, "", fmt.Errorf("读取知识库文档正文失败：钉钉返回了文档结构，但没有可同步的正文内容，请确认该文档不是空文档或暂不支持的类型")
+	}
+	fileName := markdownFileName(name)
+	return []byte(content), fileName, nil
+}
+
+func (c *Client) DownloadWikiSpreadsheetContent(ctx context.Context, workbookID, name string) ([]byte, string, error) {
+	sheets, err := c.ListWorkbookSheets(ctx, workbookID)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(sheets) == 0 {
+		return nil, "", fmt.Errorf("读取知识库表格失败：钉钉返回的工作簿没有工作表")
+	}
+
+	var b strings.Builder
+	title := strings.TrimSpace(name)
+	if title == "" {
+		title = "钉钉表格"
+	}
+	b.WriteString("# ")
+	b.WriteString(title)
+	b.WriteString("\n\n")
+
+	hasContent := false
+	for _, sheet := range sheets {
+		sheetID := sheet.identifier()
+		if sheetID == "" {
+			continue
+		}
+		var rows [][]string
+		for _, rangeAddress := range spreadsheetRangeAddresses(sheet.RowCount, sheet.ColumnCount) {
+			rangeRows, err := c.GetWorkbookRange(ctx, workbookID, sheetID, rangeAddress)
+			if err != nil {
+				return nil, "", fmt.Errorf("读取知识库表格 %s 失败：%w", sheet.displayName(), err)
+			}
+			rows = append(rows, rangeRows...)
+		}
+		rows = trimEmptySpreadsheetRows(rows)
+		if len(rows) == 0 {
+			continue
+		}
+		hasContent = true
+		b.WriteString("## ")
+		b.WriteString(sheet.displayName())
+		b.WriteString("\n\n")
+		b.WriteString(markdownTable(rows))
+		b.WriteString("\n\n")
+	}
+
+	if !hasContent {
+		return nil, "", errEmptyWikiSpreadsheet
+	}
+	return []byte(strings.TrimSpace(b.String()) + "\n"), markdownFileName(name), nil
+}
+
+func (c *Client) ListWorkbookSheets(ctx context.Context, workbookID string) ([]workbookSheetItem, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	path := fmt.Sprintf("/v1.0/doc/workbooks/%s/sheets", url.PathEscape(workbookID))
+	var out listWorkbookSheetsResponse
+	if err := c.doAPI(ctx, http.MethodGet, path, q, nil, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Value) > 0 {
+		return out.Value, nil
+	}
+	if len(out.Sheets) > 0 {
+		return out.Sheets, nil
+	}
+	return out.Items, nil
+}
+
+func (c *Client) GetWorkbookRange(ctx context.Context, workbookID, sheetID, rangeAddress string) ([][]string, error) {
+	q := url.Values{}
+	q.Set("operatorId", c.cfg.OperatorUnionID)
+	path := fmt.Sprintf("/v1.0/doc/workbooks/%s/sheets/%s/ranges/%s",
+		url.PathEscape(workbookID), url.PathEscape(sheetID), url.PathEscape(rangeAddress))
+	var out map[string]interface{}
+	if err := c.doAPI(ctx, http.MethodGet, path, q, nil, &out); err != nil {
+		return nil, err
+	}
+	return extractSpreadsheetRows(out), nil
+}
+
+func extractDingTalkBlockText(v interface{}) string {
+	if root, ok := v.(map[string]interface{}); ok {
+		if blocks := dingTalkBlocks(root); len(blocks) > 0 {
+			parts := make([]string, 0, len(blocks))
+			for _, block := range blocks {
+				if part := extractDingTalkBlock(block); part != "" {
+					parts = append(parts, part)
+				}
+			}
+			return strings.Join(parts, "\n\n")
+		}
+	}
+
+	return extractDingTalkTextFields(v)
+}
+
+func dingTalkBlocks(root map[string]interface{}) []map[string]interface{} {
+	for _, key := range []string{"blocks", "data"} {
+		if blocks := interfaceMapSlice(root[key]); len(blocks) > 0 {
+			return blocks
+		}
+	}
+	if result, ok := root["result"].(map[string]interface{}); ok {
+		for _, key := range []string{"blocks", "data"} {
+			if blocks := interfaceMapSlice(result[key]); len(blocks) > 0 {
+				return blocks
+			}
+		}
+	}
+	return nil
+}
+
+func extractDingTalkBlock(v map[string]interface{}) string {
+	if table := mapField(v, "table"); table != nil || strings.EqualFold(stringField(v, "type"), "table") || strings.EqualFold(stringField(v, "blockType"), "table") {
+		if table == nil {
+			table = v
+		}
+		if content := markdownTable(extractDingTalkTableRows(table)); content != "" {
+			return content
+		}
+	}
+	return extractDingTalkTextFields(v)
+}
+
+func extractDingTalkTextFields(v interface{}) string {
+	var parts []string
+	var walk func(interface{}, string)
+	walk = func(cur interface{}, key string) {
+		switch val := cur.(type) {
+		case map[string]interface{}:
+			for k, child := range val {
+				walk(child, k)
+			}
+		case []interface{}:
+			for _, child := range val {
+				walk(child, key)
+			}
+		case string:
+			switch strings.ToLower(key) {
+			case "text", "content", "plaintext", "plain_text":
+				if s := strings.TrimSpace(val); s != "" {
+					parts = append(parts, s)
+				}
+			}
+		}
+	}
+	walk(v, "")
+	return strings.Join(parts, "\n")
+}
+
+func extractDingTalkTableRows(table map[string]interface{}) [][]string {
+	for _, key := range []string{"rows", "tableRows", "table_rows", "cells"} {
+		if rows := tableRowsFromInterface(table[key]); len(rows) > 0 {
+			return rows
+		}
+	}
+
+	// Some responses wrap rows in a nested data/result object.
+	for _, child := range table {
+		if nested, ok := child.(map[string]interface{}); ok {
+			if rows := extractDingTalkTableRows(nested); len(rows) > 0 {
+				return rows
+			}
+		}
+	}
+	return nil
+}
+
+func tableRowsFromInterface(v interface{}) [][]string {
+	rawRows, ok := v.([]interface{})
+	if !ok || len(rawRows) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0, len(rawRows))
+	for _, rawRow := range rawRows {
+		cells := tableCellsFromInterface(rawRow)
+		if len(cells) == 0 {
+			return nil
+		}
+		rows = append(rows, cells)
+	}
+	return rows
+}
+
+func tableCellsFromInterface(v interface{}) []string {
+	switch val := v.(type) {
+	case []interface{}:
+		cells := make([]string, 0, len(val))
+		for _, cell := range val {
+			cells = append(cells, extractDingTalkTableCell(cell))
+		}
+		return cells
+	case map[string]interface{}:
+		for _, key := range []string{"cells", "columns", "children", "items"} {
+			if cells := tableCellsFromInterface(val[key]); len(cells) > 0 {
+				return cells
+			}
+		}
+	}
+	return nil
+}
+
+func extractDingTalkTableCell(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return strings.TrimSpace(val)
+	case []interface{}:
+		parts := make([]string, 0, len(val))
+		for _, child := range val {
+			if text := extractDingTalkTableCell(child); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]interface{}:
+		for _, key := range []string{"value", "cell", "tableCell", "text", "content", "plaintext", "plain_text"} {
+			if _, exists := val[key]; !exists {
+				continue
+			}
+			if text := extractDingTalkTableCell(val[key]); text != "" {
+				return text
+			}
+		}
+		if imageURL := extractDingTalkImageURL(val); imageURL != "" {
+			return fmt.Sprintf("![](%s)", imageURL)
+		}
+	}
+	return ""
+}
+
+func extractDingTalkImageURL(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		value := strings.TrimSpace(val)
+		if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+			return value
+		}
+	case []interface{}:
+		for _, child := range val {
+			if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+				return imageURL
+			}
+		}
+	case map[string]interface{}:
+		for candidate, child := range val {
+			key := strings.ToLower(candidate)
+			switch key {
+			case "url", "src", "imageurl", "image_url", "downloadurl", "download_url", "resourceurl", "resource_url", "contenturl", "content_url":
+				if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+					return imageURL
+				}
+			}
+		}
+		for candidate, child := range val {
+			key := strings.ToLower(candidate)
+			if key == "image" || key == "picture" || key == "inlineimage" || key == "inline_image" || key == "media" {
+				if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+					return imageURL
+				}
+			}
+		}
+		if strings.EqualFold(stringField(val, "type"), "image") || strings.EqualFold(stringField(val, "blockType"), "image") {
+			for _, child := range val {
+				if imageURL := extractDingTalkImageURL(child); imageURL != "" {
+					return imageURL
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func interfaceMapSlice(v interface{}) []map[string]interface{} {
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		if m, ok := item.(map[string]interface{}); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func mapField(m map[string]interface{}, key string) map[string]interface{} {
+	for candidate, value := range m {
+		if strings.EqualFold(candidate, key) {
+			if result, ok := value.(map[string]interface{}); ok {
+				return result
+			}
+		}
+	}
+	return nil
+}
+
+func stringField(m map[string]interface{}, key string) string {
+	for candidate, value := range m {
+		if strings.EqualFold(candidate, key) {
+			if result, ok := value.(string); ok {
+				return result
+			}
+		}
+	}
+	return ""
+}
+
+func (s workbookSheetItem) identifier() string {
+	switch {
+	case strings.TrimSpace(s.SheetID) != "":
+		return strings.TrimSpace(s.SheetID)
+	case strings.TrimSpace(s.ID) != "":
+		return strings.TrimSpace(s.ID)
+	case strings.TrimSpace(s.Name) != "":
+		return strings.TrimSpace(s.Name)
+	default:
+		return strings.TrimSpace(s.Title)
+	}
+}
+
+func (s workbookSheetItem) displayName() string {
+	switch {
+	case strings.TrimSpace(s.Name) != "":
+		return strings.TrimSpace(s.Name)
+	case strings.TrimSpace(s.Title) != "":
+		return strings.TrimSpace(s.Title)
+	case strings.TrimSpace(s.SheetID) != "":
+		return strings.TrimSpace(s.SheetID)
+	default:
+		return "工作表"
+	}
+}
+
+const dingtalkSpreadsheetMaxCellsPerRange = 30000
+
+func spreadsheetRangeAddresses(rows, cols int) []string {
+	if rows <= 0 || rows > 1000 {
+		rows = 1000
+	}
+	if cols <= 0 || cols > 50 {
+		cols = 50
+	}
+	rowsPerRange := dingtalkSpreadsheetMaxCellsPerRange / cols
+	if rowsPerRange <= 0 {
+		rowsPerRange = 1
+	}
+	ranges := make([]string, 0, (rows+rowsPerRange-1)/rowsPerRange)
+	for start := 1; start <= rows; start += rowsPerRange {
+		end := start + rowsPerRange - 1
+		if end > rows {
+			end = rows
+		}
+		ranges = append(ranges, fmt.Sprintf("A%d:%s%d", start, spreadsheetColumnName(cols), end))
+	}
+	return ranges
+}
+
+func spreadsheetColumnName(n int) string {
+	if n <= 0 {
+		return "A"
+	}
+	var out []byte
+	for n > 0 {
+		n--
+		out = append([]byte{byte('A' + n%26)}, out...)
+		n /= 26
+	}
+	return string(out)
+}
+
+func extractSpreadsheetRows(v interface{}) [][]string {
+	rows := findSpreadsheetRows(v)
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		cells := make([]string, 0, len(row))
+		for _, cell := range row {
+			cells = append(cells, spreadsheetCellString(cell))
+		}
+		out = append(out, cells)
+	}
+	return out
+}
+
+func findSpreadsheetRows(v interface{}) [][]interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		for _, key := range []string{"displayValues", "values", "formattedValues"} {
+			if rows := rowsFromInterface(val[key]); len(rows) > 0 {
+				return rows
+			}
+		}
+		for _, child := range val {
+			if rows := findSpreadsheetRows(child); len(rows) > 0 {
+				return rows
+			}
+		}
+	case []interface{}:
+		if rows := rowsFromInterface(val); len(rows) > 0 {
+			return rows
+		}
+		for _, child := range val {
+			if rows := findSpreadsheetRows(child); len(rows) > 0 {
+				return rows
+			}
+		}
+	}
+	return nil
+}
+
+func rowsFromInterface(v interface{}) [][]interface{} {
+	rawRows, ok := v.([]interface{})
+	if !ok || len(rawRows) == 0 {
+		return nil
+	}
+	rows := make([][]interface{}, 0, len(rawRows))
+	for _, rawRow := range rawRows {
+		row, ok := rawRow.([]interface{})
+		if !ok {
+			return nil
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func spreadsheetCellString(v interface{}) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(val)
+	case float64:
+		return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.10f", val), "0"), ".")
+	case bool:
+		if val {
+			return "TRUE"
+		}
+		return "FALSE"
+	case map[string]interface{}:
+		for _, key := range []string{"displayValue", "formattedValue", "text", "value"} {
+			if s := spreadsheetCellString(val[key]); s != "" {
+				return s
+			}
+		}
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+func trimEmptySpreadsheetRows(rows [][]string) [][]string {
+	out := rows[:0]
+	for _, row := range rows {
+		for len(row) > 0 && strings.TrimSpace(row[len(row)-1]) == "" {
+			row = row[:len(row)-1]
+		}
+		empty := true
+		for _, cell := range row {
+			if strings.TrimSpace(cell) != "" {
+				empty = false
+				break
+			}
+		}
+		if !empty {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func markdownTable(rows [][]string) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	width := 0
+	for _, row := range rows {
+		if len(row) > width {
+			width = len(row)
+		}
+	}
+	if width == 0 {
+		return ""
+	}
+	normalized := make([][]string, len(rows))
+	for i, row := range rows {
+		normalized[i] = make([]string, width)
+		copy(normalized[i], row)
+	}
+	var b strings.Builder
+	writeMarkdownRow(&b, normalized[0])
+	separator := make([]string, width)
+	for i := range separator {
+		separator[i] = "---"
+	}
+	writeMarkdownRow(&b, separator)
+	for _, row := range normalized[1:] {
+		writeMarkdownRow(&b, row)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func writeMarkdownRow(b *strings.Builder, row []string) {
+	b.WriteString("|")
+	for _, cell := range row {
+		b.WriteString(" ")
+		b.WriteString(escapeMarkdownTableCell(cell))
+		b.WriteString(" |")
+	}
+	b.WriteString("\n")
+}
+
+func escapeMarkdownTableCell(s string) string {
+	s = strings.ReplaceAll(s, "\n", "<br>")
+	s = strings.ReplaceAll(s, "|", "\\|")
+	return s
+}
+
+func humanizeDingTalkAPIError(path, msg string, status int) string {
+	action := "调用钉钉接口失败"
+	switch {
+	case strings.Contains(path, "/oauth2/accessToken"):
+		action = "获取钉钉访问令牌失败"
+	case strings.Contains(path, "/drive/spaces"):
+		action = "读取钉钉云盘空间失败"
+	case strings.Contains(path, "/storage/spaces") && strings.Contains(path, "/dentries"):
+		action = "读取钉钉云盘文件失败"
+	case strings.Contains(path, "/wiki/workspaces"):
+		action = "读取钉钉知识库列表失败"
+	case strings.Contains(path, "/wiki/nodes"):
+		action = "读取钉钉知识库目录失败"
+	case strings.Contains(path, "/doc/dentries") && strings.Contains(path, "/queryDentryId"):
+		action = "解析钉钉知识库上传文件下载标识失败"
+	case strings.Contains(path, "/doc/suites/documents") && strings.Contains(path, "/blocks"):
+		action = "读取钉钉知识库文档正文失败"
+	case strings.Contains(path, "/doc/workbooks") && strings.Contains(path, "/sheets") && strings.Contains(path, "/ranges"):
+		action = "读取钉钉知识库表格内容失败"
+	case strings.Contains(path, "/doc/workbooks") && strings.Contains(path, "/sheets"):
+		action = "读取钉钉知识库表格工作表失败"
+	}
+
+	hint := strings.TrimSpace(msg)
+	switch status {
+	case http.StatusUnauthorized:
+		hint = "AppKey 或 AppSecret 无效，或应用访问令牌已失效"
+	case http.StatusForbidden:
+		if strings.Contains(path, "/doc/dentries") && strings.Contains(path, "/queryDentryId") {
+			hint = withDingTalkOriginalDetail("当前应用缺少知识库文档读取权限，或操作人无权访问该文件。请在钉钉开放平台开通 Document.WorkspaceDocument.Read，并确认该成员能访问目标知识库文件", msg)
+		} else if strings.Contains(path, "/downloadInfos") {
+			hint = withDingTalkOriginalDetail("当前应用缺少企业存储文件下载信息读权限，或操作人无权下载该文件。请在钉钉开放平台开通 Storage.DownloadInfo.Read，并确认该成员能访问目标知识库文件", msg)
+		} else if strings.Contains(path, "/doc/workbooks") {
+			hint = withDingTalkOriginalDetail("当前应用或操作人 UnionID 没有读取钉钉表格的权限。请在钉钉开放平台为应用开通钉钉表格/工作簿读取权限，并确认该成员能访问这个知识库表格", msg)
+		} else {
+			hint = withDingTalkOriginalDetail("当前应用或操作人 UnionID 没有访问权限，请在钉钉开放平台开通对应的云盘、知识库和文档读取权限，并确认该成员能访问目标内容", msg)
+		}
+	case http.StatusNotFound:
+		hint = "钉钉没有找到这个接口或资源。请确认选择的类型正确，并且知识库 ID 使用 workspaceId，云盘 ID 使用 spaceId"
+	case http.StatusBadRequest:
+		if hint == "" {
+			hint = "请求参数不完整或格式不正确，请检查 AppKey、AppSecret、UnionID 和空间/知识库 ID"
+		}
+		if strings.Contains(path, "/doc/workbooks") && strings.Contains(strings.ToLower(hint), "doc key") {
+			hint = "钉钉认为这个节点不是可读取的表格，或应用缺少表格读取权限。请确认同步范围里选择的是钉钉表格节点，并在开放平台开通钉钉表格/知识库读取权限"
+		}
+	}
+	if hint == "" {
+		hint = fmt.Sprintf("钉钉返回 HTTP %d", status)
+	}
+	return fmt.Sprintf("%s：%s（接口：%s，HTTP %d）", action, hint, path, status)
+}
+
+func formatDingTalkAPIErrorDetail(apiErr apiErrorBody, raw []byte) string {
+	code := strings.TrimSpace(apiErr.Code)
+	message := strings.TrimSpace(apiErr.Message)
+	requestID := strings.TrimSpace(apiErr.RequestID)
+	if requestID == "" {
+		requestID = strings.TrimSpace(apiErr.RequestIDCamel)
+	}
+	var detail string
+	switch {
+	case code != "" && message != "":
+		detail = fmt.Sprintf("code=%s message=%s", code, message)
+	case code != "":
+		detail = "code=" + code
+	case message != "":
+		detail = message
+	default:
+		detail = truncate(string(raw), 200)
+	}
+	if requestID != "" {
+		detail += " requestId=" + requestID
+	}
+	return detail
+}
+
+func withDingTalkOriginalDetail(hint, detail string) string {
+	detail = strings.TrimSpace(detail)
+	if detail == "" || strings.Contains(hint, detail) {
+		return hint
+	}
+	return hint + "。钉钉原始返回：" + detail
+}
+
+func (r listSpacesResponse) normalizedSpaces() []spaceItem {
+	if len(r.Spaces) > 0 {
+		return r.Spaces
+	}
+	return r.Items
+}
+
+func (r listDentriesResponse) normalizedDentries() []dentryItem {
+	dentries := r.Dentries
+	if len(dentries) == 0 {
+		dentries = r.Items
+	}
+	for i := range dentries {
+		if dentries[i].ID == "" {
+			switch {
+			case dentries[i].DentryID != "":
+				dentries[i].ID = dentries[i].DentryID
+			case dentries[i].DentryUUID != "":
+				dentries[i].ID = dentries[i].DentryUUID
+			}
+		}
+	}
+	return dentries
+}
+
+func (r listDentriesResponse) normalizedNextToken() string {
+	if r.NextToken != "" {
+		return r.NextToken
+	}
+	return r.NextCursor
+}
+
+func (r listWikiWorkspacesResponse) normalizedWorkspaces() []wikiWorkspaceItem {
+	if len(r.Workspaces) > 0 {
+		return r.Workspaces
+	}
+	return r.Items
+}
+
+func (r listWikiNodesResponse) normalizedNodes() []wikiNodeItem {
+	if len(r.Nodes) > 0 {
+		return r.Nodes
+	}
+	return r.Items
+}
+
+func (c *Client) isAllowedDownloadHost(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	if base, err := url.Parse(c.cfg.GetAPIBase()); err == nil && strings.EqualFold(u.Host, base.Host) {
+		return true
+	}
+	allowed := []string{"dingtalk.com", "aliyuncs.com", "alicdn.com"}
+	for _, suffix := range allowed {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

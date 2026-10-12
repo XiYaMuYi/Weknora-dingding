@@ -2,1365 +2,1181 @@ package dingtalk
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
-	"sort"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
-	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-const (
-	cursorVersion     = 2
-	maxTraversalNodes = 1_000_000
-)
+var _ datasource.Connector = (*Connector)(nil)
 
-// mediaExtensions are the file types this connector deliberately never
-// downloads: media carries no text WeKnora could index.
-var mediaExtensions = map[string]struct{}{
-	"mp4": {}, "mov": {}, "avi": {}, "mkv": {}, "flv": {}, "wmv": {}, "m4v": {}, "webm": {},
-	"mp3": {}, "wav": {}, "m4a": {}, "aac": {}, "flac": {},
-}
+const dingtalkContentParserVersion = "4"
 
-// unsupportedDocumentExtensions names the native DingTalk document types the
-// wiki API lists but this connector has no ingest path for, so a skip can name
-// the concrete type instead of only saying the node is unsupported. The
-// remaining types expose no read API at all.
-var unsupportedDocumentExtensions = map[string]string{
-	"able":  "DingTalk multi-dimensional table",
-	"amind": "DingTalk mind map",
-	"appt":  "DingTalk presentation",
-	"adraw": "DingTalk drawing",
-}
+// Connector implements datasource.Connector for DingTalk online documents.
+type Connector struct{}
 
-// skipReason explains, in the words of the sync log, why a node the connector
-// just listed will not be ingested. Both answers are deterministic: retrying
-// the sync can never turn such a node into a document, which is what separates
-// a skip from a failed read that must be retried.
-func skipReason(n node, settings documentSettings) string {
-	extension := strings.ToLower(strings.TrimSpace(n.Extension))
-	_, knownMediaExtension := mediaExtensions[extension]
-	if strings.EqualFold(n.Category, "VIDEO") || knownMediaExtension {
-		return "video/media files are deliberately not downloaded by this connector"
-	}
-	// An uploaded file this connector could read, but this data source was
-	// never told to. Naming the switch makes the skip actionable instead of
-	// looking like a missing feature.
-	if n.isBinaryDocument() && !settings.IncludeUploadedFiles {
-		return "uploaded files are not ingested because include_uploaded_files is not enabled for this data source"
-	}
-	if label := unsupportedDocumentExtensions[extension]; label != "" {
-		return label + " has no ingest path in this connector yet"
-	}
-	return "no ingest path for this DingTalk node type in this connector yet"
-}
+func NewConnector() *Connector { return &Connector{} }
 
-// scopeLabel names a sync scope the way an operator can match it in DingTalk:
-// the workspace followed by the node the scan starts from.
-func scopeLabel(scope syncScope) string {
-	nodeID := scope.StartNodeID
-	if scope.Document != nil {
-		nodeID = scope.Document.ID
-	}
-	if nodeID == "" {
-		return scope.Reference.WorkspaceID
-	}
-	return scope.Reference.WorkspaceID + "/" + nodeID
-}
+func (c *Connector) Type() string { return types.ConnectorTypeDingTalk }
 
-var (
-	_ datasource.Connector          = (*Connector)(nil)
-	_ datasource.FullSyncWithCursor = (*Connector)(nil)
-)
-
-type apiFactory func(*config) dingTalkAPI
-
-// Connector imports DingTalk wiki documents: native adoc documents through the
-// blocks API, and uploaded Office/PDF files through the 钉盘 download API.
-type Connector struct {
-	newAPI apiFactory
-}
-
-// NewConnector creates a DingTalk data source connector.
-func NewConnector() *Connector {
-	return &Connector{newAPI: func(cfg *config) dingTalkAPI { return newClient(cfg) }}
-}
-
-func (c *Connector) api(cfg *config) dingTalkAPI {
-	if c != nil && c.newAPI != nil {
-		return c.newAPI(cfg)
-	}
-	return newClient(cfg)
-}
-
-// Type returns the registered data source type.
-func (c *Connector) Type() string {
-	return types.ConnectorTypeDingTalk
-}
-
-// maxValidateProbes caps how many documents Validate reads before giving up.
-// An app missing the document read permission fails every probe, so without a
-// cap a large tenant would turn one Validate into hundreds of serial calls.
-const maxValidateProbes = 5
-
-// Validate checks the application credentials and operator access, including
-// node listing and a sample document read when one is visible in a workspace.
-//
-// The operator is not expected to reach every workspace in the tenant: app
-// credentials are valid as long as one reachable workspace yields one readable
-// document. Reading the first document of the first workspace and failing on it
-// rejects a working configuration whenever an unrelated workspace — one the
-// operator was never granted — happens to be listed first.
-func (c *Connector) Validate(ctx context.Context, dataSourceConfig *types.DataSourceConfig) error {
-	cfg, err := parseConfig(dataSourceConfig)
+func (c *Connector) Validate(ctx context.Context, config *types.DataSourceConfig) error {
+	cfg, settings, err := parseDingTalkConfig(config)
 	if err != nil {
 		return err
 	}
-	api := c.api(cfg)
-	settings := parseDocumentSettings(dataSourceConfig)
-	workspaces, err := api.listWorkspaces(ctx)
-	if err != nil {
-		return fmt.Errorf("validate DingTalk data source: %w", err)
+	client := NewClient(cfg)
+	if err := client.Ping(ctx); err != nil {
+		return fmt.Errorf("dingtalk connection failed: %w", err)
 	}
-
-	var (
-		lastErr       error
-		sawDocument   bool
-		inconclusive  bool
-		workspaceFail int
-		probes        int
-		listings      int
-	)
-	for _, item := range workspaces {
-		rootNodeID := strings.TrimSpace(item.RootNodeID)
-		if rootNodeID == "" {
-			continue
-		}
-		document, found, unexplored, err := firstValidateDocument(
-			ctx, api, rootNodeID, settings, &listings,
-		)
-		if err != nil {
-			lastErr = fmt.Errorf("workspace %q: %w", item.Name, err)
-			// A cancelled or timed-out request proves nothing about the
-			// credentials, so it must never fall through to acceptance.
-			if ctx.Err() != nil || isContextError(err) {
-				return fmt.Errorf("validate DingTalk data source: %w", lastErr)
-			}
-			workspaceFail++
-			continue
-		}
-		if unexplored {
-			inconclusive = true
-		}
-		if !found {
-			continue
-		}
-		sawDocument = true
-		probes++
-		if err := verifyDocument(ctx, api, document); err != nil {
-			lastErr = fmt.Errorf("workspace %q document %q: %w", item.Name, document.Name, err)
-			if ctx.Err() != nil || isContextError(err) {
-				return fmt.Errorf("validate DingTalk data source: %w", lastErr)
-			}
-		} else {
-			return nil
-		}
-		if probes >= maxValidateProbes {
-			break
-		}
-	}
-	// Folders were left unexplored, because the listing budget ran out or a
-	// folder could not be listed, so an unreadable document elsewhere does not
-	// prove the data source is unusable.
-	if inconclusive {
+	// If the user manually configured resource IDs, validation only checks the
+	// token. Listing spaces/workspaces may require broader browse permissions
+	// than syncing an already-known node.
+	if len(config.ResourceIDs) > 0 {
 		return nil
 	}
-
-	// Nothing readable anywhere. Only a tenant that exposed no document at all
-	// is accepted: there was nothing to read, so credentials could not be
-	// disproved. A document that exists but cannot be read means the data
-	// source would sync nothing, which is worth reporting.
-	if !sawDocument && workspaceFail == 0 {
-		return nil
-	}
-	if lastErr == nil {
-		return nil
-	}
-	return fmt.Errorf("validate DingTalk data source: %w", lastErr)
-}
-
-// maxValidateListings caps the node listing pages Validate requests while
-// looking for a document, shared by all workspaces. Each page is one HTTP
-// request of up to 50 nodes, and only the first page of each workspace root is
-// outside the budget, so the walk issues at most
-// len(workspaces) + maxValidateListings node listing requests (plus the
-// client's retries of each).
-const maxValidateListings = 20
-
-// firstValidateDocument walks a workspace breadth-first, the way scanWorkspace
-// does, and returns the first document it finds. It requests one page at a
-// time instead of listing whole folders, so the budget bounds real requests.
-// unexplored reports that some nodes were never seen, because the budget ran
-// out or a folder could not be listed, so the walk cannot prove the workspace
-// holds no readable document.
-//
-// The walk selects nodes with the same settings-aware predicate the picker and
-// the sync use, so a type the data source does not ingest is never probed.
-func firstValidateDocument(
-	ctx context.Context,
-	api dingTalkAPI,
-	rootNodeID string,
-	settings documentSettings,
-	listings *int,
-) (document node, found, unexplored bool, err error) {
-	queue := []string{rootNodeID}
-	visited := map[string]struct{}{rootNodeID: {}}
-	for len(queue) > 0 {
-		parent := queue[0]
-		queue = queue[1:]
-		// Finish every page of a folder before descending, like listNodes
-		// does for scanWorkspace: a document on a later page of this folder
-		// must be found before the budget is spent on its subfolders.
-		var subfolders []string
-		pageToken := ""
-		seenTokens := map[string]struct{}{}
-		for {
-			rootPage := parent == rootNodeID && pageToken == ""
-			if !rootPage {
-				if *listings >= maxValidateListings {
-					return node{}, false, true, nil
-				}
-				*listings++
-			}
-			children, next, listErr := api.listNodesPage(ctx, parent, pageToken)
-			if listErr != nil {
-				if rootPage || ctx.Err() != nil || isContextError(listErr) {
-					return node{}, false, false, listErr
-				}
-				// The documents this operator can read may live in exactly
-				// this folder, so its failure leaves the walk inconclusive
-				// rather than treating the folder as empty.
-				unexplored = true
-				break
-			}
-			for _, child := range children {
-				if child.isIngestible(settings) {
-					return child, true, unexplored, nil
-				}
-				if child.isFolder() || child.HasChildren {
-					if _, seen := visited[child.ID]; seen {
-						continue
-					}
-					visited[child.ID] = struct{}{}
-					subfolders = append(subfolders, child.ID)
-				}
-			}
-			if next == "" {
-				break
-			}
-			if _, repeated := seenTokens[next]; repeated {
-				// listNodes rejects a repeated nextToken; here the rest of the
-				// folder is simply unknown.
-				unexplored = true
-				break
-			}
-			seenTokens[next] = struct{}{}
-			pageToken = next
+	if settings.DingTalkType == "wiki" {
+		if _, err := client.ListWikiWorkspaces(ctx); err != nil {
+			return fmt.Errorf("dingtalk wiki access failed: %w", err)
 		}
-		queue = append(queue, subfolders...)
+		return nil
 	}
-	return node{}, false, unexplored, nil
+	if _, err := client.ListSpaces(ctx); err != nil {
+		return fmt.Errorf("dingtalk drive access failed: %w", err)
+	}
+	return nil
 }
 
-// verifyDocument proves one visible document is readable. Native documents are
-// probed through their own read API — the blocks API for adoc — while uploaded
-// files resolve their 钉盘 download location, which exercises the same
-// permissions and returns the same errors a real download would, without
-// transferring the payload.
-//
-// #3782 landed a narrower version of this probe (the blocks API only) with a
-// comment saying uploaded files and native spreadsheets join it "when their
-// ingest paths land". This is that follow-up: an uploaded file is not an adoc,
-// so probing it through documentBlocks would report a readable file as
-// unreadable and reject a working data source.
-func verifyDocument(ctx context.Context, api dingTalkAPI, document node) error {
-	if document.isOnlineDocument() {
-		_, err := api.documentBlocks(ctx, document.ID)
-		return err
-	}
-	return api.verifyDocumentDownload(ctx, document.ID)
-}
-
-// ListResources lazily lists selectable workspaces, folders and documents.
 func (c *Connector) ListResources(
-	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
-	parentID string,
+	ctx context.Context, config *types.DataSourceConfig, parentID string,
 ) ([]types.Resource, error) {
-	cfg, err := parseConfig(dataSourceConfig)
+	cfg, settings, err := parseDingTalkConfig(config)
 	if err != nil {
 		return nil, err
 	}
-	api := c.api(cfg)
-	settings := parseDocumentSettings(dataSourceConfig)
-	if strings.TrimSpace(parentID) == "" {
-		workspaces, err := api.listWorkspaces(ctx)
+	client := NewClient(cfg)
+
+	if settings.DingTalkType == "wiki" {
+		return c.listWikiResources(ctx, client, parentID)
+	}
+
+	if parentID == "" {
+		spaces, err := client.ListSpaces(ctx)
 		if err != nil {
 			return nil, err
 		}
-		resources := make([]types.Resource, 0, len(workspaces))
-		for _, item := range workspaces {
-			if strings.TrimSpace(item.ID) == "" {
-				continue
-			}
-			resourceID, err := encodeResourceReference(resourceReference{WorkspaceID: item.ID})
-			if err != nil {
-				return nil, err
-			}
-			name := strings.TrimSpace(item.Name)
-			if name == "" {
-				name = item.ID
-			}
-			resources = append(resources, types.Resource{
-				ExternalID:  resourceID,
-				Name:        name,
-				Type:        "wiki_space",
-				Description: item.Description,
-				URL:         item.URL,
-				ModifiedAt:  parseDingTalkTime(item.ModifiedTime),
-				HasChildren: strings.TrimSpace(item.RootNodeID) != "",
+		out := make([]types.Resource, 0, len(spaces))
+		for _, sp := range spaces {
+			out = append(out, types.Resource{
+				ExternalID:  makeSpaceResourceID(sp.SpaceID),
+				Name:        sp.SpaceName,
+				Type:        "space",
+				HasChildren: true,
 				Metadata: map[string]interface{}{
-					"workspace_id": item.ID,
+					"space_type": sp.SpaceType,
 				},
 			})
 		}
-		sortResources(resources)
-		return resources, nil
+		return out, nil
 	}
 
-	parentRef, err := decodeResourceReference(parentID)
-	if err != nil {
-		return nil, err
-	}
-	parentNodeID := parentRef.NodeID
-	if parentNodeID == "" {
-		workspaces, err := api.listWorkspaces(ctx)
-		if err != nil {
-			return nil, err
-		}
-		item, exists := workspaceByID(workspaces, parentRef.WorkspaceID)
-		if !exists {
-			return nil, fmt.Errorf("%w: DingTalk workspace %q is unavailable",
-				datasource.ErrResourceNotFound, parentRef.WorkspaceID)
-		}
-		parentNodeID = strings.TrimSpace(item.RootNodeID)
-		if parentNodeID == "" {
-			return []types.Resource{}, nil
-		}
-	} else {
-		workspaces, err := api.listWorkspaces(ctx)
-		if err != nil {
-			return nil, err
-		}
-		scopes, failures, err := resolveSyncScopes(ctx, api, workspaces, []string{parentID}, settings)
-		if err != nil {
-			return nil, err
-		}
-		if failure := failures[parentID]; failure != nil {
-			return nil, failure
-		}
-		if len(scopes) != 1 {
-			// One reference resolves to exactly one scope. Any other count means
-			// there is nothing behind it that could be listed; the picker reads
-			// an error as a failed expansion, so the honest empty listing is
-			// returned instead.
-			logger.Warnf(ctx,
-				"[DingTalk] expand %s: resolved %d scopes, want one; reporting no children",
-				parentID, len(scopes))
-			return []types.Resource{}, nil
-		}
-		if scopes[0].Document != nil {
-			// A document is a leaf: it genuinely has no children. Returning an
-			// error here (the previous "is not an expandable folder") surfaces
-			// in the picker as a failure toast for a selection that syncs fine,
-			// so the empty listing is the correct answer. The picker is told
-			// HasChildren=false for a document, which is what keeps it from
-			// offering the expander in the first place.
-			logger.Warnf(ctx,
-				"[DingTalk] expand %s: the reference is a document, not a folder; reporting no children",
-				parentID)
-			return []types.Resource{}, nil
-		}
-		parentNodeID = scopes[0].StartNodeID
+	spaceID, dentryID := parseResourceID(parentID)
+	if spaceID == "" {
+		return nil, fmt.Errorf("invalid parent resource id: %s", parentID)
 	}
 
-	children, err := api.listNodes(ctx, parentNodeID)
+	parentDentry := dentryID
+	dentries, _, err := client.ListDentries(ctx, spaceID, parentDentry, "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list dentries: %w", err)
 	}
-	resources := make([]types.Resource, 0, len(children))
-	for _, child := range children {
-		if !child.isFolder() && !child.isIngestible(settings) {
-			continue
+
+	out := make([]types.Resource, 0, len(dentries))
+	for _, d := range dentries {
+		resType := "folder"
+		if strings.EqualFold(d.Type, "FILE") {
+			if !isSyncableDriveDentry(d) {
+				continue
+			}
+			resType = "doc"
 		}
-		if child.WorkspaceID != "" && child.WorkspaceID != parentRef.WorkspaceID {
-			return nil, fmt.Errorf("DingTalk node %q belongs to a different workspace", child.ID)
-		}
-		childRef := parentRef.child(child.ID)
-		resourceID, err := encodeResourceReference(childRef)
-		if err != nil {
-			return nil, err
-		}
-		resourceType := "document"
-		if child.isFolder() {
-			resourceType = "folder"
-		}
-		resources = append(resources, types.Resource{
-			ExternalID:  resourceID,
-			Name:        child.title(),
-			Type:        resourceType,
-			URL:         child.URL,
-			ModifiedAt:  child.modifiedAt(),
+		mod := parseUpdatedTime(d.UpdatedTime)
+		out = append(out, types.Resource{
+			ExternalID:  makeDentryResourceID(spaceID, d.ID),
+			Name:        d.Name,
+			Type:        resType,
 			ParentID:    parentID,
-			HasChildren: child.isFolder(),
+			HasChildren: strings.EqualFold(d.Type, "FOLDER"),
+			ModifiedAt:  mod,
 			Metadata: map[string]interface{}{
-				"workspace_id": parentRef.WorkspaceID,
-				"node_id":      child.ID,
-				"category":     child.Category,
-				"extension":    child.Extension,
+				"space_id":  spaceID,
+				"dentry_id": d.ID,
+				"extension": d.Extension,
 			},
 		})
 	}
-	sortResources(resources)
-	return resources, nil
+	return out, nil
 }
 
-// ResolveResourceAncestors restores the paths embedded in saved selections.
 func (c *Connector) ResolveResourceAncestors(
-	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
-	resourceIDs []string,
+	ctx context.Context, config *types.DataSourceConfig, resourceIDs []string,
 ) ([]string, error) {
-	if _, err := parseConfig(dataSourceConfig); err != nil {
+	cfg, settings, err := parseDingTalkConfig(config)
+	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	client := NewClient(cfg)
+
+	if settings.DingTalkType == "wiki" {
+		return c.resolveWikiResourceAncestors(ctx, client, resourceIDs)
 	}
-	seen := make(map[string]struct{})
+
+	seen := make(map[string]bool)
 	var ancestors []string
-	for _, resourceID := range resourceIDs {
-		ref, err := decodeResourceReference(resourceID)
-		if err != nil {
-			return nil, err
-		}
-		ids, err := resourceAncestorIDs(ref)
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range ids {
-			if _, exists := seen[id]; exists {
-				continue
-			}
-			seen[id] = struct{}{}
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
 			ancestors = append(ancestors, id)
+		}
+	}
+
+	for _, rid := range resourceIDs {
+		spaceID, dentryID := parseResourceID(rid)
+		if spaceID == "" || dentryID == "" {
+			continue
+		}
+		add(makeSpaceResourceID(spaceID))
+
+		current := dentryID
+		for i := 0; i < 32 && current != ""; i++ {
+			d, err := client.GetDentry(ctx, spaceID, current)
+			if err != nil {
+				logger.Warnf(ctx, "[DingTalk] resolve ancestors get dentry %s:%s: %v", spaceID, current, err)
+				break
+			}
+			if d.ParentID == "" {
+				break
+			}
+			add(makeDentryResourceID(spaceID, d.ParentID))
+			current = d.ParentID
 		}
 	}
 	return ancestors, nil
 }
 
-func sortResources(resources []types.Resource) {
-	sort.SliceStable(resources, func(i, j int) bool {
-		left, right := strings.ToLower(resources[i].Name), strings.ToLower(resources[j].Name)
-		if left == right {
-			return resources[i].ExternalID < resources[j].ExternalID
+func (c *Connector) listWikiResources(ctx context.Context, client *Client, parentID string) ([]types.Resource, error) {
+	if parentID == "" {
+		workspaces, err := client.ListWikiWorkspaces(ctx)
+		if err != nil {
+			return nil, err
 		}
-		return left < right
-	})
+		out := make([]types.Resource, 0, len(workspaces))
+		for _, ws := range workspaces {
+			out = append(out, types.Resource{
+				ExternalID:  makeWikiWorkspaceResourceID(ws.WorkspaceID),
+				Name:        ws.Name,
+				Type:        "wiki_space",
+				URL:         ws.URL,
+				HasChildren: ws.RootNodeID != "",
+				Metadata: map[string]interface{}{
+					"workspace_id": ws.WorkspaceID,
+					"root_node_id": ws.RootNodeID,
+				},
+			})
+		}
+		return out, nil
+	}
+
+	workspaceID, nodeID := parseWikiResourceID(parentID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("invalid wiki parent resource id: %s", parentID)
+	}
+	if nodeID == "" {
+		rootNodeID, err := c.findWikiRootNodeID(ctx, client, workspaceID)
+		if err != nil {
+			return nil, err
+		}
+		nodeID = rootNodeID
+	}
+
+	nodes, _, err := client.ListWikiNodes(ctx, nodeID, "")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]types.Resource, 0, len(nodes))
+	for _, n := range nodes {
+		resType := "doc"
+		hasChildren := false
+		if strings.EqualFold(n.Type, "FOLDER") {
+			resType = "folder"
+			hasChildren = true
+		}
+		out = append(out, types.Resource{
+			ExternalID:  makeWikiNodeResourceID(workspaceID, n.NodeID),
+			Name:        n.Name,
+			Type:        resType,
+			URL:         n.URL,
+			ParentID:    parentID,
+			HasChildren: hasChildren,
+			ModifiedAt:  parseUpdatedTime(n.UpdatedTime),
+			Metadata: map[string]interface{}{
+				"workspace_id": workspaceID,
+				"node_id":      n.NodeID,
+				"category":     n.Category,
+			},
+		})
+	}
+	return out, nil
 }
 
-func workspaceByID(workspaces []workspace, workspaceID string) (workspace, bool) {
-	for _, item := range workspaces {
-		if item.ID == workspaceID {
-			return item, true
+func (c *Connector) resolveWikiResourceAncestors(ctx context.Context, client *Client, resourceIDs []string) ([]string, error) {
+	seen := make(map[string]bool)
+	var ancestors []string
+	for _, rid := range resourceIDs {
+		workspaceID, nodeID := parseWikiResourceID(rid)
+		if workspaceID == "" || nodeID == "" {
+			continue
+		}
+		spaceRID := makeWikiWorkspaceResourceID(workspaceID)
+		if !seen[spaceRID] {
+			seen[spaceRID] = true
+			ancestors = append(ancestors, spaceRID)
+		}
+		// DingTalk's node detail API may omit parent lineage, so the workspace
+		// ancestor is the reliable minimum needed to reveal a saved selection.
+		if _, err := client.GetWikiNode(ctx, nodeID); err != nil {
+			logger.Warnf(ctx, "[DingTalk] resolve wiki ancestor get node %s: %v", nodeID, err)
 		}
 	}
-	return workspace{}, false
+	return ancestors, nil
 }
 
-// FetchAll reads every supported document in the selected scopes.
-func (c *Connector) FetchAll(
-	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
-	resourceIDs []string,
-) ([]types.FetchedItem, error) {
-	items, _, err := c.sync(ctx, dataSourceConfig, resourceIDs, nil, syncMode{})
+func (c *Connector) findWikiRootNodeID(ctx context.Context, client *Client, workspaceID string) (string, error) {
+	workspaces, err := client.ListWikiWorkspaces(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, ws := range workspaces {
+		if ws.WorkspaceID == workspaceID {
+			if ws.RootNodeID == "" {
+				return "", fmt.Errorf("wiki workspace %s has empty root node id", workspaceID)
+			}
+			return ws.RootNodeID, nil
+		}
+	}
+	return "", fmt.Errorf("wiki workspace %s not found", workspaceID)
+}
+
+func (c *Connector) FetchAll(ctx context.Context, config *types.DataSourceConfig, resourceIDs []string) ([]types.FetchedItem, error) {
+	items, _, err := c.sync(ctx, config, resourceIDs, nil, false)
 	return items, err
 }
 
-// FetchAllFromCursor re-fetches every document and reconciles deletions against
-// the previous cursor so a scheduled full sync still honours deletion_sync.
-func (c *Connector) FetchAllFromCursor(
-	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
-	resourceIDs []string,
-	cursor *types.SyncCursor,
-) ([]types.FetchedItem, *types.SyncCursor, error) {
-	if dataSourceConfig == nil {
-		return nil, nil, fmt.Errorf("%w: config is nil", datasource.ErrInvalidConfig)
-	}
-	previous, err := decodeCursor(cursor)
-	if err != nil {
-		return nil, nil, err
-	}
-	return c.syncAndEncodeCursor(
-		ctx, dataSourceConfig, resourceIDs, previous,
-		syncMode{reconcileDeletions: true},
-	)
-}
-
-// FetchIncremental reads changed documents and reconciles complete selections.
 func (c *Connector) FetchIncremental(
-	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
-	cursor *types.SyncCursor,
+	ctx context.Context, config *types.DataSourceConfig, cursor *types.SyncCursor,
 ) ([]types.FetchedItem, *types.SyncCursor, error) {
-	if dataSourceConfig == nil {
-		return nil, nil, fmt.Errorf("%w: config is nil", datasource.ErrInvalidConfig)
+	resourceIDs := config.ResourceIDs
+	if len(resourceIDs) == 0 {
+		return nil, nil, fmt.Errorf("no resource IDs configured")
 	}
-	previous, err := decodeCursor(cursor)
-	if err != nil {
-		return nil, nil, err
+	var prev dingtalkCursor
+	if cursor != nil && cursor.ConnectorCursor != nil {
+		b, _ := json.Marshal(cursor.ConnectorCursor)
+		_ = json.Unmarshal(b, &prev)
 	}
-	return c.syncAndEncodeCursor(
-		ctx, dataSourceConfig, dataSourceConfig.ResourceIDs, previous,
-		syncMode{skipUnchanged: true, reconcileDeletions: true},
-	)
-}
-
-func (c *Connector) syncAndEncodeCursor(
-	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
-	resourceIDs []string,
-	previous *cursorState,
-	mode syncMode,
-) ([]types.FetchedItem, *types.SyncCursor, error) {
-	items, next, syncErr := c.sync(ctx, dataSourceConfig, resourceIDs, previous, mode)
-	if next == nil {
-		return items, nil, syncErr
-	}
-	encoded, err := encodeCursor(next)
-	if err != nil {
-		return nil, nil, err
-	}
-	return items, &types.SyncCursor{
-		LastSyncTime:    next.SyncedAt,
-		ConnectorCursor: encoded,
-	}, syncErr
-}
-
-type cursorState struct {
-	Version    int                          `json:"version"`
-	SyncedAt   time.Time                    `json:"synced_at"`
-	Resources  map[string]map[string]string `json:"resources"`
-	Workspaces map[string]map[string]string `json:"workspaces,omitempty"`
-}
-
-type syncMode struct {
-	skipUnchanged      bool
-	reconcileDeletions bool
-}
-
-type syncScope struct {
-	ResourceID  string
-	Reference   resourceReference
-	StartNodeID string
-	Document    *node
-}
-
-func (s syncScope) contains(candidate syncScope) bool {
-	if s.Reference.WorkspaceID != candidate.Reference.WorkspaceID {
-		return false
-	}
-	if s.Reference.NodeID == "" {
-		return true
-	}
-	if s.Document != nil {
-		return s.Reference.NodeID == candidate.Reference.NodeID
-	}
-	if s.Reference.NodeID == candidate.Reference.NodeID {
-		return true
-	}
-	for _, ancestor := range candidate.Reference.Ancestors {
-		if ancestor == s.Reference.NodeID {
-			return true
-		}
-	}
-	return false
+	return c.sync(ctx, config, resourceIDs, &prev, true)
 }
 
 func (c *Connector) sync(
 	ctx context.Context,
-	dataSourceConfig *types.DataSourceConfig,
+	config *types.DataSourceConfig,
 	resourceIDs []string,
-	previous *cursorState,
-	mode syncMode,
-) ([]types.FetchedItem, *cursorState, error) {
-	cfg, err := parseConfig(dataSourceConfig)
+	prev *dingtalkCursor,
+	incremental bool,
+) ([]types.FetchedItem, *types.SyncCursor, error) {
+	cfg, settings, err := parseDingTalkConfig(config)
 	if err != nil {
 		return nil, nil, err
 	}
-	selected := uniqueIDs(resourceIDs)
-	if len(selected) == 0 {
-		return nil, nil, errors.New("no DingTalk resources selected")
+	client := NewClient(cfg)
+
+	newCursor := dingtalkCursor{
+		LastSyncTime:      time.Now().UTC(),
+		ParserVersion:     dingtalkContentParserVersion,
+		DocRevisions:      make(map[string]string),
+		SheetFingerprints: make(map[string]string),
+	}
+	parserChanged := incremental && prev != nil && prev.ParserVersion != dingtalkContentParserVersion
+	if !parserChanged && prev != nil && prev.DocRevisions != nil {
+		for k, v := range prev.DocRevisions {
+			newCursor.DocRevisions[k] = v
+		}
+	}
+	if !parserChanged && prev != nil && prev.SheetFingerprints != nil {
+		for k, v := range prev.SheetFingerprints {
+			newCursor.SheetFingerprints[k] = v
+		}
 	}
 
-	api := c.api(cfg)
-	settings := parseDocumentSettings(dataSourceConfig)
-	workspaces, err := api.listWorkspaces(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	scopes, failures, err := resolveSyncScopes(ctx, api, workspaces, selected, settings)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	next := &cursorState{
-		Version:   cursorVersion,
-		SyncedAt:  time.Now().UTC(),
-		Resources: make(map[string]map[string]string, len(scopes)),
-	}
 	var items []types.FetchedItem
-	failedDocuments := 0
-	complete := len(failures) == 0
-	seenDocuments := make(map[string]struct{})
-	type deletionCandidate struct {
-		resourceID string
-		documentID string
-		revision   string
-	}
-	var deletions []deletionCandidate
-	for _, resourceID := range selected {
-		if failure := failures[resourceID]; failure != nil {
-			if previous != nil {
-				next.Resources[resourceID] = cloneRevisions(previous.Resources[resourceID])
-			}
-			items = append(items, failedResource(resourceID, failure))
-		}
-	}
+	seenDocs := make(map[string]docRef)
 
-	for _, scope := range scopes {
-		oldRevisions := map[string]string{}
-		if previous != nil {
-			if stored := previous.Resources[scope.ResourceID]; stored != nil {
-				oldRevisions = stored
+	for _, rid := range resourceIDs {
+		var refs []docRef
+		var err error
+		if settings.DingTalkType == "wiki" {
+			refs, err = c.collectWikiDocRefs(ctx, client, rid, settings.IncludeSubfolders)
+		} else {
+			spaceID, rootDentry := parseResourceID(rid)
+			if spaceID == "" {
+				continue
 			}
+			refs, err = c.collectDriveDocRefs(ctx, client, spaceID, rootDentry, settings.IncludeSubfolders)
 		}
-		documents, skipped, err := scanScope(ctx, api, scope, settings)
 		if err != nil {
-			if isContextError(err) {
-				return nil, nil, err
+			var partialErr *partialDocRefListError
+			if !errors.As(err, &partialErr) {
+				return nil, nil, fmt.Errorf("collect docs for %s: %w", rid, err)
 			}
-			// Never infer deletions from an incomplete tree. Other independent
-			// selections may still complete, while this scope keeps its previous
-			// cursor and is retried on the next run.
-			logger.Warnf(ctx, "[DingTalk] scan scope %s failed, will retry next sync: %v",
-				scopeLabel(scope), err)
-			complete = false
-			next.Resources[scope.ResourceID] = cloneRevisions(oldRevisions)
-			items = append(items, failedResource(scope.ResourceID, err))
+			items = appendDingTalkDocListFailureItems(items, partialErr.Failures)
+		}
+		for _, ref := range refs {
+			seenDocs[ref.externalID] = ref
+		}
+	}
+
+	for _, ref := range seenDocs {
+		rev := ref.revision
+
+		probeSheet := sheetRevisionUnreliable(ref)
+		if incremental && !parserChanged && !probeSheet && prev != nil && prev.DocRevisions != nil {
+			if old, ok := prev.DocRevisions[ref.externalID]; ok && old == rev {
+				continue
+			}
+		}
+
+		var content []byte
+		var fileName string
+		var err error
+		if ref.kind == dingtalkDocumentKindUploadedFile {
+			if strings.TrimSpace(ref.spaceID) == "" || strings.TrimSpace(ref.dentryID) == "" {
+				items = append(items, skippedUploadedFileItem(ref))
+				continue
+			}
+			content, fileName, err = client.DownloadUploadedFileContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
+		} else if ref.kind == dingtalkDocumentKindSkipped || ref.kind == dingtalkDocumentKindUnsupported {
+			items = append(items, skippedUnsupportedOnlineItem(ref))
 			continue
-		}
-
-		// Skipped nodes are deterministic: this connector has no ingest path for
-		// them, so they are reported once and never retried — unlike a failed
-		// read below, which must stay retryable.
-		for _, node := range skipped {
-			logger.Infof(ctx, "[DingTalk] skip node %s (name=%q type=%s category=%s extension=%s): %s",
-				node.ID, node.title(), node.Type, node.Category, node.Extension, skipReason(node, settings))
-		}
-
-		newRevisions := make(map[string]string, len(documents))
-		currentDocuments := make(map[string]struct{}, len(documents))
-		synced := 0
-		failed := 0
-
-		for _, document := range documents {
-			if document.ID == "" {
-				continue
+		} else if ref.docType == "wiki" {
+			switch ref.kind {
+			case dingtalkDocumentKindNativeSheet:
+				content, fileName, err = client.DownloadWikiSpreadsheetContent(ctx, ref.dentryID, ref.name)
+			case dingtalkDocumentKindNativeDoc, "":
+				content, fileName, err = client.DownloadWikiDocContent(ctx, ref.dentryID, ref.name, ref.extension)
+			default:
+				err = fmt.Errorf("暂不支持同步该钉钉知识库节点类型：%s", ref.kind)
 			}
-			seenDocuments[document.ID] = struct{}{}
-			currentDocuments[document.ID] = struct{}{}
-			revision := document.revision()
-			oldRevision, existed := oldRevisions[document.ID]
-			if mode.skipUnchanged && revision != "" && existed && revision == oldRevision {
-				newRevisions[document.ID] = revision
-				continue
+		} else {
+			content, fileName, err = client.DownloadDocContent(ctx, ref.spaceID, ref.dentryID, ref.name, ref.extension)
+		}
+		if probeSheet {
+			fingerprint := ""
+			if err == nil {
+				fingerprint = sheetContentFingerprint(content)
+			} else if errors.Is(err, errEmptyWikiSpreadsheet) {
+				fingerprint = sheetContentFingerprint(nil)
 			}
-
-			item, err := readDocument(ctx, api, scope.ResourceID, scope.Reference.WorkspaceID, document)
-			if err != nil {
-				if isContextError(err) {
-					return nil, nil, err
+			if err == nil || errors.Is(err, errEmptyWikiSpreadsheet) {
+				old := ""
+				if prev != nil && prev.SheetFingerprints != nil {
+					old = prev.SheetFingerprints[ref.externalID]
 				}
-				logger.Warnf(ctx,
-					"[DingTalk] read document %s (name=%q extension=%s) failed, will retry next sync: %v",
-					document.ID, document.title(), document.Extension, err)
-				items = append(items, failedDocument(
-					scope.ResourceID, scope.Reference.WorkspaceID, document, err,
-				))
-				failed++
-				if existed {
-					// Do not advance failed documents. The next incremental run
-					// must retry them even if modifiedTime remains unchanged.
-					newRevisions[document.ID] = oldRevision
-				}
-				continue
-			}
-			items = append(items, item)
-			synced++
-			newRevisions[document.ID] = revision
-		}
-
-		if mode.reconcileDeletions {
-			for documentID, revision := range oldRevisions {
-				if _, exists := currentDocuments[documentID]; exists {
+				newCursor.SheetFingerprints[ref.externalID] = fingerprint
+				if old != "" && old == fingerprint {
 					continue
 				}
-				deletions = append(deletions, deletionCandidate{scope.ResourceID, documentID, revision})
 			}
 		}
-		next.Resources[scope.ResourceID] = newRevisions
-
-		// One line per scope, in the same shape as the IMA connector's. total
-		// counts every file the scope listed — synced + still-unchanged +
-		// failed + skipped — so a scope that quietly loses two thirds of its
-		// nodes can no longer look like a clean run.
-		logger.Infof(ctx, "[DingTalk] scope %s: total=%d synced=%d skipped=%d failed=%d",
-			scopeLabel(scope), len(documents)+len(skipped), synced, len(skipped), failed)
-		failedDocuments += failed
-	}
-
-	// Reconcile the union of all selections. Moving a document between two
-	// selected folders must never generate both an upsert and a deletion.
-	// An unavailable scope could contain a moved document, so defer deletions
-	// and retain their revisions until every scope can be scanned again.
-	sort.Slice(deletions, func(i, j int) bool { return deletions[i].documentID < deletions[j].documentID })
-	deleted := make(map[string]struct{})
-	for _, candidate := range deletions {
-		if _, visible := seenDocuments[candidate.documentID]; visible {
+		if errors.Is(err, errEmptyWikiSpreadsheet) {
+			newCursor.DocRevisions[ref.externalID] = rev
+			items = append(items, skippedEmptySpreadsheetItem(ref))
 			continue
 		}
-		if !complete {
-			next.Resources[candidate.resourceID][candidate.documentID] = candidate.revision
+		if err != nil {
+			items = append(items, types.FetchedItem{
+				ExternalID:       ref.externalID,
+				Title:            ref.name,
+				SourceResourceID: ref.sourceResourceID,
+				Metadata: map[string]string{
+					"error":             err.Error(),
+					"dingtalk_doc_type": ref.metadataDocType(),
+					"dingtalk_doc_kind": string(ref.kind),
+				},
+			})
 			continue
 		}
-		if _, exists := deleted[candidate.documentID]; exists {
-			continue
-		}
-		deleted[candidate.documentID] = struct{}{}
+		newCursor.DocRevisions[ref.externalID] = rev
 		items = append(items, types.FetchedItem{
-			ExternalID: candidate.documentID, IsDeleted: true, SourceResourceID: candidate.resourceID,
+			ExternalID:       ref.externalID,
+			Title:            ref.name,
+			FileName:         fileName,
+			Content:          content,
+			ContentType:      contentTypeForFileName(fileName),
+			URL:              ref.itemURL(),
+			UpdatedAt:        ref.updatedAt,
+			SourceResourceID: ref.sourceResourceID,
+			Metadata: map[string]string{
+				"dingtalk_doc_type": ref.metadataDocType(),
+				"dingtalk_doc_kind": string(ref.kind),
+				"space_id":          ref.spaceID,
+				"dentry_id":         ref.dentryID,
+			},
 		})
 	}
-	if !mode.skipUnchanged && !mode.reconcileDeletions {
-		next = nil
+
+	if incremental && prev != nil && prev.DocRevisions != nil {
+		for externalID := range prev.DocRevisions {
+			if _, ok := seenDocs[externalID]; ok {
+				continue
+			}
+			delete(newCursor.DocRevisions, externalID)
+			delete(newCursor.SheetFingerprints, externalID)
+			items = append(items, types.FetchedItem{
+				ExternalID: externalID,
+				IsDeleted:  true,
+			})
+		}
 	}
-	if !complete || failedDocuments > 0 {
-		// Failure items carry localized reason codes. Returning the same raw
-		// diagnostics in Details would duplicate them as untranslated UI text.
-		return items, next, &datasource.PartialFetchError{}
+
+	next := &types.SyncCursor{
+		LastSyncTime: newCursor.LastSyncTime,
+		ConnectorCursor: map[string]interface{}{
+			"last_sync_time":     newCursor.LastSyncTime,
+			"parser_version":     newCursor.ParserVersion,
+			"doc_revisions":      newCursor.DocRevisions,
+			"sheet_fingerprints": newCursor.SheetFingerprints,
+		},
 	}
 	return items, next, nil
 }
 
-func resolveSyncScopes(
-	ctx context.Context,
-	api dingTalkAPI,
-	workspaces []workspace,
-	resourceIDs []string,
-	settings documentSettings,
-) ([]syncScope, map[string]error, error) {
-	byID := make(map[string]workspace, len(workspaces))
-	for _, item := range workspaces {
-		byID[item.ID] = item
+type docRefListFailure struct {
+	Ref docRef
+	Err error
+}
+
+type partialDocRefListError struct {
+	Failures []docRefListFailure
+}
+
+func (e *partialDocRefListError) Error() string {
+	if e == nil || len(e.Failures) == 0 {
+		return "partial dingtalk document listing failed"
 	}
-	childrenCache := make(map[string][]node)
-	listChildren := func(parentNodeID string) ([]node, error) {
-		if cached, exists := childrenCache[parentNodeID]; exists {
-			return cached, nil
+	parts := make([]string, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		parts = append(parts, failure.Err.Error())
+	}
+	return strings.Join(parts, "; ")
+}
+
+func appendDingTalkDocListFailureItems(items []types.FetchedItem, failures []docRefListFailure) []types.FetchedItem {
+	for _, failure := range failures {
+		ref := failure.Ref
+		title := ref.name
+		if title == "" {
+			title = ref.dentryID
 		}
-		children, err := api.listNodes(ctx, parentNodeID)
+		meta := map[string]string{
+			"error":             failure.Err.Error(),
+			"channel":           types.ChannelDingtalk,
+			"dingtalk_doc_type": ref.metadataDocType(),
+			"failure_stage":     "list_children",
+		}
+		if ref.spaceID != "" {
+			meta["space_id"] = ref.spaceID
+		}
+		if ref.dentryID != "" {
+			meta["dentry_id"] = ref.dentryID
+		}
+		items = append(items, types.FetchedItem{
+			ExternalID:       ref.externalID,
+			Title:            title,
+			SourceResourceID: ref.sourceResourceID,
+			Metadata:         meta,
+		})
+	}
+	return items
+}
+
+type docRef struct {
+	externalID       string
+	nodeID           string
+	spaceID          string
+	dentryID         string
+	fileID           string
+	locatorError     string
+	name             string
+	extension        string
+	revision         string
+	updatedAt        time.Time
+	sourceResourceID string
+	url              string
+	docType          string
+	kind             dingtalkDocumentKind
+	revisionReliable bool
+}
+
+func (r docRef) itemURL() string {
+	if r.url != "" {
+		return r.url
+	}
+	return fmt.Sprintf("https://alidocs.dingtalk.com/i/nodes/%s", r.dentryID)
+}
+
+func (r docRef) metadataDocType() string {
+	if r.docType != "" {
+		return r.docType
+	}
+	return "doc"
+}
+
+type dingtalkDocumentKind string
+
+const (
+	dingtalkDocumentKindNativeDoc    dingtalkDocumentKind = "native_doc"
+	dingtalkDocumentKindNativeSheet  dingtalkDocumentKind = "native_sheet"
+	dingtalkDocumentKindUploadedFile dingtalkDocumentKind = "uploaded_file"
+	dingtalkDocumentKindUnsupported  dingtalkDocumentKind = "unsupported"
+	dingtalkDocumentKindSkipped      dingtalkDocumentKind = "skipped"
+)
+
+func normalizeWikiDocumentKind(n wikiNodeItem) dingtalkDocumentKind {
+	if !strings.EqualFold(n.Type, "FILE") {
+		return dingtalkDocumentKindUnsupported
+	}
+	category := strings.ToUpper(strings.TrimSpace(n.Category))
+	nameExt := wikiNodeNameExtension(n)
+	ext := extensionFromWikiNode(n)
+	if isDingTalkNativeSpreadsheetExtension(nameExt) {
+		return dingtalkDocumentKindNativeSheet
+	}
+	if nameExt != "" && isDingTalkNativeOnlineDocExtension(nameExt) {
+		return dingtalkDocumentKindNativeDoc
+	}
+	// Native workbook nodes use the workbook API even when their display name
+	// happens to end in .xlsx; uploaded XLSX attachments are classified below
+	// by their DOCUMENT category and use storage download instead.
+	switch category {
+	case "SPREADSHEET", "SHEET", "ALISHEET", "WORKBOOK", "AIOBJECT", "AIBASE", "AIFORM":
+		return dingtalkDocumentKindNativeSheet
+	case "WHITEBOARD", "MINDNOTE", "MINDMAP", "FORM", "SLIDES", "PRESENTATION", "PDF":
+		return dingtalkDocumentKindSkipped
+	}
+	// A storage locator does not make an arbitrary binary an ingestible
+	// attachment. Format support must be decided before download routing.
+	if isSupportedUploadedFileExtension(nameExt) || isSupportedUploadedFileExtension(ext) {
+		return dingtalkDocumentKindUploadedFile
+	}
+	switch category {
+	case "ALIDOC", "DOC", "DOCUMENT":
+		if isSupportedUploadedFileExtension(nameExt) {
+			return dingtalkDocumentKindUploadedFile
+		}
+		if nameExt != "" {
+			return dingtalkDocumentKindSkipped
+		}
+		return dingtalkDocumentKindNativeDoc
+	default:
+		if isSupportedUploadedFileExtension(ext) {
+			return dingtalkDocumentKindUploadedFile
+		}
+		return dingtalkDocumentKindSkipped
+	}
+}
+
+func (c *Connector) collectDocRefs(
+	ctx context.Context, client *Client, spaceID, rootDentryID string, recursive bool,
+) ([]docRef, error) {
+	return c.collectDriveDocRefs(ctx, client, spaceID, rootDentryID, recursive)
+}
+
+func (c *Connector) enrichWikiNodeForDownload(ctx context.Context, client *Client, n wikiNodeItem) wikiNodeItem {
+	detail, err := client.GetWikiNode(ctx, n.NodeID)
+	if err != nil || detail == nil {
+		if err != nil {
+			logger.Warnf(ctx, "[DingTalk] get wiki node detail %s failed: %v", n.NodeID, err)
+		}
+		return n
+	}
+	if detail.NodeID == "" {
+		detail.NodeID = n.NodeID
+	}
+	if detail.WorkspaceID == "" {
+		detail.WorkspaceID = n.WorkspaceID
+	}
+	if detail.Name == "" {
+		detail.Name = n.Name
+	}
+	if detail.Type == "" {
+		detail.Type = n.Type
+	}
+	if detail.Category == "" {
+		detail.Category = n.Category
+	}
+	if detail.URL == "" {
+		detail.URL = n.URL
+	}
+	if detail.UpdatedTime == "" {
+		detail.UpdatedTime = n.UpdatedTime
+	}
+	if detail.Size == 0 {
+		detail.Size = n.Size
+	}
+	return *detail
+}
+
+func (c *Connector) collectDriveDocRefs(
+	ctx context.Context, client *Client, spaceID, rootDentryID string, recursive bool,
+) ([]docRef, error) {
+	var refs []docRef
+	var failures []docRefListFailure
+	var walk func(parentID string) error
+	walk = func(parentID string) error {
+		cursor := ""
+		for {
+			dentries, next, err := client.ListDentries(ctx, spaceID, parentID, cursor)
+			if err != nil {
+				return err
+			}
+			for _, d := range dentries {
+				if strings.EqualFold(d.Type, "FOLDER") {
+					if recursive {
+						if err := walk(d.ID); err != nil {
+							failures = append(failures, docRefListFailure{
+								Ref: docRef{
+									externalID:       makeStableDocExternalID(spaceID, d.ID),
+									spaceID:          spaceID,
+									dentryID:         d.ID,
+									name:             d.Name,
+									revision:         revisionKey(d),
+									updatedAt:        parseUpdatedTime(d.UpdatedTime),
+									sourceResourceID: makeDentryResourceID(spaceID, d.ID),
+								},
+								Err: fmt.Errorf("list children of %s: %w", d.ID, err),
+							})
+							continue
+						}
+					}
+					continue
+				}
+				if !isSyncableDriveDentry(d) {
+					continue
+				}
+				extID := makeStableDocExternalID(spaceID, d.ID)
+				refs = append(refs, docRef{
+					externalID:       extID,
+					spaceID:          spaceID,
+					dentryID:         d.ID,
+					name:             d.Name,
+					extension:        d.Extension,
+					revision:         revisionKey(d),
+					updatedAt:        parseUpdatedTime(d.UpdatedTime),
+					sourceResourceID: makeDentryResourceID(spaceID, d.ID),
+					kind:             driveDocumentKind(d),
+				})
+			}
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		return nil
+	}
+	if err := walk(rootDentryID); err != nil {
+		return nil, err
+	}
+	if len(failures) > 0 {
+		return refs, &partialDocRefListError{Failures: failures}
+	}
+	return refs, nil
+}
+
+func (c *Connector) collectWikiDocRefs(
+	ctx context.Context, client *Client, resourceID string, recursive bool,
+) ([]docRef, error) {
+	workspaceID, nodeID := parseWikiResourceID(resourceID)
+	if workspaceID == "" {
+		return nil, nil
+	}
+	if nodeID == "" {
+		rootNodeID, err := c.findWikiRootNodeID(ctx, client, workspaceID)
 		if err != nil {
 			return nil, err
 		}
-		childrenCache[parentNodeID] = children
-		return children, nil
+		nodeID = rootNodeID
 	}
 
-	resolve := func(resourceID string) (syncScope, error) {
-		ref, err := decodeResourceReference(resourceID)
-		if err != nil {
-			return syncScope{}, err
-		}
-		canonicalID, err := encodeResourceReference(ref)
-		if err != nil {
-			return syncScope{}, err
-		}
-		item, exists := byID[ref.WorkspaceID]
-		if !exists {
-			return syncScope{}, fmt.Errorf("%w: DingTalk workspace %q is unavailable",
-				datasource.ErrResourceNotFound, ref.WorkspaceID)
-		}
-		rootNodeID := strings.TrimSpace(item.RootNodeID)
-		if rootNodeID == "" {
-			return syncScope{}, fmt.Errorf("DingTalk workspace %q has no root node", ref.WorkspaceID)
-		}
-		if ref.NodeID == "" {
-			return syncScope{
-				ResourceID: canonicalID, Reference: ref, StartNodeID: rootNodeID,
-			}, nil
-		}
-
-		parentNodeID := rootNodeID
-		for _, ancestorID := range ref.Ancestors {
-			children, err := listChildren(parentNodeID)
+	var refs []docRef
+	var failures []docRefListFailure
+	var walk func(parentNodeID string) error
+	walk = func(parentNodeID string) error {
+		cursor := ""
+		for {
+			nodes, next, err := client.ListWikiNodes(ctx, parentNodeID, cursor)
 			if err != nil {
-				return syncScope{}, fmt.Errorf("resolve DingTalk resource path: %w", err)
+				return err
 			}
-			ancestor, exists := childByID(children, ancestorID)
-			if !exists || !ancestor.isFolder() {
-				return syncScope{}, fmt.Errorf("%w: DingTalk ancestor %q is unavailable",
-					datasource.ErrResourceNotFound, ancestorID)
+			for _, n := range nodes {
+				if strings.EqualFold(n.Type, "FOLDER") {
+					if recursive {
+						if err := walk(n.NodeID); err != nil {
+							failures = append(failures, docRefListFailure{
+								Ref: docRef{
+									externalID:       makeStableWikiDocExternalID(workspaceID, n.NodeID),
+									spaceID:          workspaceID,
+									dentryID:         n.NodeID,
+									name:             n.Name,
+									extension:        extensionFromWikiNode(n),
+									revision:         wikiRevisionKey(n),
+									revisionReliable: n.UpdatedTime != "" || n.Size != 0,
+									updatedAt:        parseUpdatedTime(n.UpdatedTime),
+									sourceResourceID: makeWikiNodeResourceID(workspaceID, n.NodeID),
+									url:              n.URL,
+									docType:          "wiki",
+								},
+								Err: fmt.Errorf("list children of %s: %w", n.NodeID, err),
+							})
+							continue
+						}
+					}
+					continue
+				}
+				if !strings.EqualFold(n.Type, "FILE") {
+					continue
+				}
+				n = c.enrichWikiNodeForDownload(ctx, client, n)
+				kind := normalizeWikiDocumentKind(n)
+				if kind == dingtalkDocumentKindUnsupported {
+					continue
+				}
+				spaceID := workspaceID
+				dentryID := n.NodeID
+				fileID := ""
+				locatorError := ""
+				if kind == dingtalkDocumentKindUploadedFile {
+					// Knowledge-base node IDs are not storage dentry IDs. Only use
+					// the storage locator when DingTalk returned one explicitly.
+					spaceID = strings.TrimSpace(n.SpaceID)
+					dentryID = strings.TrimSpace(firstNonEmpty(n.DentryID, n.FileID))
+					fileID = strings.TrimSpace(n.FileID)
+					if spaceID == "" || dentryID == "" {
+						if resolved, resolveErr := client.ResolveDentryIDByUUID(ctx, n.NodeID); resolveErr != nil {
+							logger.Warnf(ctx, "[DingTalk] resolve uploaded wiki attachment %s to storage dentry failed: %v", n.NodeID, resolveErr)
+							locatorError = resolveErr.Error()
+						} else {
+							spaceID = resolved.SpaceID
+							dentryID = resolved.DentryID
+						}
+					}
+				} else if n.DocKey != "" {
+					dentryID = n.DocKey
+				} else if n.WorkbookID != "" {
+					dentryID = n.WorkbookID
+				}
+				refs = append(refs, docRef{
+					externalID:       makeStableWikiDocExternalID(workspaceID, n.NodeID),
+					nodeID:           n.NodeID,
+					spaceID:          spaceID,
+					dentryID:         dentryID,
+					fileID:           fileID,
+					locatorError:     locatorError,
+					name:             n.Name,
+					extension:        extensionFromWikiNode(n),
+					revision:         wikiRevisionKey(n),
+					revisionReliable: n.UpdatedTime != "" || n.Size != 0,
+					updatedAt:        parseUpdatedTime(n.UpdatedTime),
+					sourceResourceID: makeWikiNodeResourceID(workspaceID, n.NodeID),
+					url:              n.URL,
+					docType:          "wiki",
+					kind:             kind,
+				})
 			}
-			if ancestor.WorkspaceID != "" && ancestor.WorkspaceID != ref.WorkspaceID {
-				return syncScope{}, fmt.Errorf("DingTalk ancestor %q belongs to a different workspace", ancestorID)
-			}
-			parentNodeID = ancestor.ID
-		}
-		children, err := listChildren(parentNodeID)
-		if err != nil {
-			return syncScope{}, fmt.Errorf("resolve DingTalk resource: %w", err)
-		}
-		selectedNode, exists := childByID(children, ref.NodeID)
-		if !exists {
-			return syncScope{}, fmt.Errorf("%w: DingTalk node %q is unavailable",
-				datasource.ErrResourceNotFound, ref.NodeID)
-		}
-		if selectedNode.WorkspaceID != "" && selectedNode.WorkspaceID != ref.WorkspaceID {
-			return syncScope{}, fmt.Errorf("DingTalk node %q belongs to a different workspace", ref.NodeID)
-		}
-		switch {
-		case selectedNode.isFolder():
-			return syncScope{
-				ResourceID: canonicalID, Reference: ref, StartNodeID: selectedNode.ID,
-			}, nil
-		case selectedNode.isIngestible(settings):
-			document := selectedNode
-			return syncScope{
-				ResourceID: canonicalID, Reference: ref, Document: &document,
-			}, nil
-		default:
-			return syncScope{}, fmt.Errorf("DingTalk node %q is not a supported online document or folder",
-				ref.NodeID)
-		}
-	}
-	var scopes []syncScope
-	failures := make(map[string]error)
-	for _, resourceID := range resourceIDs {
-		scope, err := resolve(resourceID)
-		if err != nil {
-			if isContextError(err) {
-				return nil, nil, err
-			}
-			failures[resourceID] = err
-			continue
-		}
-		scopes = append(scopes, scope)
-	}
-
-	sort.SliceStable(scopes, func(i, j int) bool {
-		leftDepth := len(scopes[i].Reference.Ancestors)
-		rightDepth := len(scopes[j].Reference.Ancestors)
-		if scopes[i].Reference.NodeID != "" {
-			leftDepth++
-		}
-		if scopes[j].Reference.NodeID != "" {
-			rightDepth++
-		}
-		if leftDepth == rightDepth {
-			return scopes[i].ResourceID < scopes[j].ResourceID
-		}
-		return leftDepth < rightDepth
-	})
-	compacted := make([]syncScope, 0, len(scopes))
-	for _, scope := range scopes {
-		covered := false
-		for _, parent := range compacted {
-			if parent.contains(scope) {
-				covered = true
+			if next == "" {
 				break
 			}
+			cursor = next
 		}
-		if !covered {
-			compacted = append(compacted, scope)
-		}
+		return nil
 	}
-	return compacted, failures, nil
-}
-
-func childByID(children []node, nodeID string) (node, bool) {
-	for _, child := range children {
-		if child.ID == nodeID {
-			return child, true
-		}
+	if err := walk(nodeID); err != nil {
+		return nil, err
 	}
-	return node{}, false
-}
-
-// scanScope lists every ingestible document in one scope, together with the
-// nodes it saw but cannot ingest. The skipped nodes are returned rather than
-// discarded so the caller can report them: a full sync must never look clean
-// while silently dropping part of the tree.
-func scanScope(
-	ctx context.Context,
-	api dingTalkAPI,
-	scope syncScope,
-	settings documentSettings,
-) ([]node, []node, error) {
-	if scope.Document != nil {
-		return []node{*scope.Document}, nil, nil
+	if len(failures) > 0 {
+		return refs, &partialDocRefListError{Failures: failures}
 	}
-	return scanWorkspace(ctx, api, scope.Reference.WorkspaceID, scope.StartNodeID, settings)
+	return refs, nil
 }
 
-// scanWorkspace walks a workspace subtree breadth-first. Folders are traversal
-// only; every file is either an ingestible document or a skip.
-func scanWorkspace(
-	ctx context.Context,
-	api dingTalkAPI,
-	workspaceID string,
-	rootNodeID string,
-	settings documentSettings,
-) ([]node, []node, error) {
-	queue := []string{rootNodeID}
-	visitedParents := make(map[string]struct{})
-	seenNodes := make(map[string]struct{})
-	var documents []node
-	var skipped []node
-
-	for len(queue) > 0 {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-		parentID := queue[0]
-		queue = queue[1:]
-		if _, visited := visitedParents[parentID]; visited {
-			continue
-		}
-		visitedParents[parentID] = struct{}{}
-
-		children, err := api.listNodes(ctx, parentID)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, child := range children {
-			if child.ID == "" {
-				continue
-			}
-			if child.WorkspaceID != "" && child.WorkspaceID != workspaceID {
-				return nil, nil, fmt.Errorf("DingTalk node %q belongs to a different workspace", child.ID)
-			}
-			if _, seen := seenNodes[child.ID]; seen {
-				continue
-			}
-			seenNodes[child.ID] = struct{}{}
-			if len(seenNodes) > maxTraversalNodes {
-				return nil, nil, fmt.Errorf("DingTalk workspace exceeds %d nodes", maxTraversalNodes)
-			}
-			switch {
-			case child.isIngestible(settings):
-				documents = append(documents, child)
-			case child.isFolder():
-				// Containers hold no content of their own, so they are never
-				// reported as skipped.
-			default:
-				skipped = append(skipped, child)
-			}
-			if child.isFolder() || child.HasChildren {
-				queue = append(queue, child.ID)
-			}
-		}
-	}
-	sort.SliceStable(documents, func(i, j int) bool {
-		return documents[i].ID < documents[j].ID
-	})
-	sort.SliceStable(skipped, func(i, j int) bool {
-		return skipped[i].ID < skipped[j].ID
-	})
-	return documents, skipped, nil
-}
-
-func cloneRevisions(revisions map[string]string) map[string]string {
-	cloned := make(map[string]string, len(revisions))
-	for documentID, revision := range revisions {
-		cloned[documentID] = revision
-	}
-	return cloned
-}
-
-type renderResult struct {
-	Markdown     string
-	UnknownTypes []string
-}
-
-// unknownBlockTypes identifies a document whose Blocks payload contains types
-// the renderer does not model. The log line and the pipeline event are both
-// built from this value, so the collection logic is testable on its own
-// instead of through log text.
-type unknownBlockTypes struct {
-	NodeID     string
-	Title      string
-	URL        string
-	BlockTypes []string
-}
-
-// collectUnknownBlockTypes reports the unknown block types of a rendered
-// document, or false when the document rendered without loss.
-func collectUnknownBlockTypes(document node, rendered renderResult) (unknownBlockTypes, bool) {
-	if len(rendered.UnknownTypes) == 0 {
-		return unknownBlockTypes{}, false
-	}
-	types := make([]string, len(rendered.UnknownTypes))
-	copy(types, rendered.UnknownTypes)
-	return unknownBlockTypes{
-		NodeID:     document.ID,
-		Title:      document.title(),
-		URL:        strings.TrimSpace(document.URL),
-		BlockTypes: types,
-	}, true
-}
-
-func (u unknownBlockTypes) fields() map[string]interface{} {
-	return map[string]interface{}{
-		"node_id":     u.NodeID,
-		"title":       u.Title,
-		"url":         u.URL,
-		"block_types": strings.Join(u.BlockTypes, ","),
-		"count":       len(u.BlockTypes),
+func skippedUploadedFileItem(ref docRef) types.FetchedItem {
+	return types.FetchedItem{
+		ExternalID:       ref.externalID,
+		Title:            ref.name,
+		UpdatedAt:        ref.updatedAt,
+		SourceResourceID: ref.sourceResourceID,
+		Metadata: map[string]string{
+			"channel":           types.ChannelDingtalk,
+			"node_id":           ref.nodeID,
+			"space_id":          ref.spaceID,
+			"dentry_id":         ref.dentryID,
+			"file_id":           ref.fileID,
+			"dingtalk_doc_type": ref.metadataDocType(),
+			"dingtalk_doc_kind": string(ref.kind),
+			"skip_reason":       dingtalkUploadedFileSkipReason(ref.name, ref.locatorError),
+		},
 	}
 }
 
-// warnUnknownBlockTypes surfaces blocks the renderer could not model. The type
-// names also land in document metadata, but metadata is invisible to operators
-// watching sync logs, so the loss is reported as a warning and as a structured
-// pipeline event as well. Content of those blocks is still missing from the
-// rendered Markdown until their payloads are modelled.
-func warnUnknownBlockTypes(ctx context.Context, document node, rendered renderResult) {
-	unknown, ok := collectUnknownBlockTypes(document, rendered)
-	if !ok {
-		return
+func skippedUnsupportedOnlineItem(ref docRef) types.FetchedItem {
+	return types.FetchedItem{
+		ExternalID:       ref.externalID,
+		Title:            ref.name,
+		UpdatedAt:        ref.updatedAt,
+		SourceResourceID: ref.sourceResourceID,
+		Metadata: map[string]string{
+			"channel":           types.ChannelDingtalk,
+			"node_id":           ref.nodeID,
+			"space_id":          ref.spaceID,
+			"dentry_id":         ref.dentryID,
+			"file_id":           ref.fileID,
+			"dingtalk_doc_type": ref.metadataDocType(),
+			"dingtalk_doc_kind": string(ref.kind),
+			"skip_reason":       dingtalkUnsupportedOnlineSkipReason(ref.name, ref.extension),
+		},
 	}
-	logger.Warnf(ctx,
-		"[DingTalk] document %s (%s) contains unmodelled block types %s; their text is not rendered",
-		unknown.NodeID, unknown.Title, strings.Join(unknown.BlockTypes, ", "))
-	common.PipelineWarn(ctx, "DingTalkConnector", "unknown_block_types", unknown.fields())
 }
 
-// readDocument turns one supported wiki node into a FetchedItem. Native adoc
-// documents are rendered from their blocks, and uploaded files are transferred
-// byte-for-byte so WeKnora's own parsers can read them.
-func readDocument(
-	ctx context.Context,
-	api dingTalkAPI,
-	sourceResourceID string,
-	workspaceID string,
-	document node,
-) (types.FetchedItem, error) {
+func skippedEmptySpreadsheetItem(ref docRef) types.FetchedItem {
+	return types.FetchedItem{
+		ExternalID:       ref.externalID,
+		Title:            ref.name,
+		UpdatedAt:        ref.updatedAt,
+		SourceResourceID: ref.sourceResourceID,
+		Metadata: map[string]string{
+			"channel":           types.ChannelDingtalk,
+			"space_id":          ref.spaceID,
+			"dentry_id":         ref.dentryID,
+			"dingtalk_doc_type": ref.metadataDocType(),
+			"dingtalk_doc_kind": string(ref.kind),
+			"skip_reason":       "钉钉在线表格暂无单元格内容；已记录当前版本，表格更新后会在后续增量同步中重新读取。",
+		},
+	}
+}
+
+func dingtalkUploadedFileSkipReason(name, locatorError string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "该文件"
+	}
+	if strings.TrimSpace(locatorError) != "" {
+		return fmt.Sprintf("%s 是上传到钉钉的附件文件，调用知识库附件转换接口失败：%s", name, locatorError)
+	}
+	return fmt.Sprintf("%s 是上传到钉钉的附件文件，但钉钉未返回可用的钉盘 spaceId/dentryId，暂时无法下载。请确认应用具有企业存储文件下载权限，或在钉钉中重新上传后再同步。", name)
+}
+
+func dingtalkUnsupportedOnlineSkipReason(name, extension string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "该内容"
+	}
+	return fmt.Sprintf("%s 暂不支持同步%s。当前版本支持钉钉在线文档和在线表格；白板、脑图、表单、演示、PDF 阅读、CAD、模型、图片、音视频等内容请先整理或转换为钉钉在线文档/在线表格后再同步。", name, dingtalkUnsupportedTypeLabel(name, extension))
+}
+
+func dingtalkUnsupportedTypeLabel(name, extension string) string {
+	s := strings.ToLower(strings.TrimSpace(name + " " + extension))
 	switch {
-	case document.isOnlineDocument():
-		blocks, err := api.documentBlocks(ctx, document.ID)
-		if err != nil {
-			return types.FetchedItem{}, err
-		}
-		rendered := renderDocument(document.title(), blocks)
-		// The renderer stays context-free; the warning is emitted here, where
-		// both the request context and the node identity are known. Uploaded
-		// files take the default branch and have no rendering step to lose.
-		warnUnknownBlockTypes(ctx, document, rendered)
-		return fetchedDocument(sourceResourceID, workspaceID, document, rendered), nil
+	case strings.Contains(s, "whiteboard") || strings.Contains(s, "白板"):
+		return "钉钉白板"
+	case strings.Contains(s, "mind") || strings.Contains(s, "脑图"):
+		return "钉钉脑图"
+	case strings.Contains(s, "form") || strings.Contains(s, "表单"):
+		return "钉钉表单"
+	case strings.Contains(s, "slide") || strings.Contains(s, "presentation") || strings.Contains(s, "演示"):
+		return "钉钉演示"
+	case strings.Contains(s, "pdf"):
+		return "钉钉 PDF 阅读内容"
+	case strings.Contains(s, "cad") || strings.Contains(s, "dwg"):
+		return "CAD/工程图"
 	default:
-		data, err := api.downloadDocument(ctx, document.ID)
-		if err != nil {
-			return types.FetchedItem{}, err
-		}
-		return fetchedBinaryDocument(sourceResourceID, workspaceID, document, data), nil
+		return "该在线类型"
 	}
 }
 
-// documentMetadata describes a wiki node the same way for rendered and
-// downloaded documents, so both stay searchable by their DingTalk identity.
-func documentMetadata(workspaceID string, document node) map[string]string {
-	return map[string]string{
-		"channel":      types.ChannelDingtalk,
-		"workspace_id": workspaceID,
-		"node_id":      document.ID,
-		"category":     document.Category,
-		"extension":    document.Extension,
-	}
+const (
+	prefixSpace  = "space:"
+	prefixDentry = ":dentry:"
+	prefixWiki   = "wiki:"
+	prefixNode   = ":node:"
+)
+
+func makeSpaceResourceID(spaceID string) string {
+	return prefixSpace + spaceID
 }
 
-// documentURL is the address a reader can open the node at in DingTalk.
-func documentURL(document node) string {
-	if url := strings.TrimSpace(document.URL); url != "" {
-		return url
-	}
-	return "https://alidocs.dingtalk.com/i/nodes/" + url.PathEscape(document.ID)
+func makeDentryResourceID(spaceID, dentryID string) string {
+	return prefixSpace + spaceID + prefixDentry + dentryID
 }
 
-func fetchedDocument(
-	sourceResourceID string,
-	workspaceID string,
-	document node,
-	rendered renderResult,
-) types.FetchedItem {
-	metadata := documentMetadata(workspaceID, document)
-	if len(rendered.UnknownTypes) > 0 {
-		metadata["unknown_block_types"] = strings.Join(rendered.UnknownTypes, ",")
-	}
-	return types.FetchedItem{
-		ExternalID:       document.ID,
-		Title:            document.title(),
-		Content:          []byte(rendered.Markdown),
-		ContentType:      "text/markdown",
-		FileName:         renderedDocumentFileName(document.title()),
-		URL:              documentURL(document),
-		UpdatedAt:        document.modifiedAt(),
-		Metadata:         metadata,
-		SourceResourceID: sourceResourceID,
-	}
+func makeStableDocExternalID(spaceID, dentryID string) string {
+	return spaceID + ":" + dentryID
 }
 
-// renderedDocumentFileName names a document this connector renders as markdown.
-// The node's name is used as reported — a DingTalk name normally carries its
-// own extension — but ".md" is appended exactly once, so a name that already
-// ends in .md does not grow a second extension.
-func renderedDocumentFileName(title string) string {
-	name := sanitizeFilename(title)
-	if stem, trimmed := trimSuffixFold(name, ".md"); trimmed {
-		name = stem
+func parseResourceID(rid string) (spaceID, dentryID string) {
+	rid = strings.TrimSpace(rid)
+	if !strings.HasPrefix(rid, prefixSpace) {
+		return "", ""
 	}
-	return name + ".md"
+	rest := strings.TrimPrefix(rid, prefixSpace)
+	if idx := strings.Index(rest, prefixDentry); idx >= 0 {
+		return rest[:idx], rest[idx+len(prefixDentry):]
+	}
+	return rest, ""
 }
 
-// fetchedBinaryDocument wraps an uploaded file's raw bytes. The file name keeps
-// the original extension because that is what selects the parser during
-// ingestion; the MIME type records the same fact and is set to a concrete Office
-// type rather than the generic octet-stream the object store reports.
-func fetchedBinaryDocument(
-	sourceResourceID string,
-	workspaceID string,
-	document node,
-	data []byte,
-) types.FetchedItem {
-	contentType, ok := document.binaryContentType()
-	if !ok {
-		contentType = "application/octet-stream"
-	}
-	return types.FetchedItem{
-		ExternalID:       document.ID,
-		Title:            document.title(),
-		Content:          data,
-		ContentType:      contentType,
-		FileName:         binaryDocumentFileName(document),
-		URL:              documentURL(document),
-		UpdatedAt:        document.modifiedAt(),
-		Metadata:         documentMetadata(workspaceID, document),
-		SourceResourceID: sourceResourceID,
-	}
+func makeWikiWorkspaceResourceID(workspaceID string) string {
+	return prefixWiki + workspaceID
 }
 
-// binaryDocumentFileName derives the stored file name. DingTalk node names
-// normally already end in the extension, so it is replaced rather than
-// appended: "Employee-Handbook.docx" must not become
-// "Employee-Handbook.docx.docx".
-func binaryDocumentFileName(document node) string {
-	extension := strings.ToLower(strings.TrimSpace(document.Extension))
-	name := strings.TrimSpace(document.title())
-	if extension == "" {
-		return sanitizeFilename(name)
-	}
-	if stem, ok := trimSuffixFold(name, "."+extension); ok {
-		name = stem
-	}
-	return sanitizeFilename(name) + "." + extension
+func makeWikiNodeResourceID(workspaceID, nodeID string) string {
+	return prefixWiki + workspaceID + prefixNode + nodeID
 }
 
-// trimSuffixFold removes suffix from value, comparing case-insensitively.
-func trimSuffixFold(value, suffix string) (string, bool) {
-	if !strings.HasSuffix(strings.ToLower(value), strings.ToLower(suffix)) {
-		return value, false
-	}
-	return value[:len(value)-len(suffix)], true
+func makeStableWikiDocExternalID(workspaceID, nodeID string) string {
+	return "wiki:" + workspaceID + ":" + nodeID
 }
 
-func failedDocument(
-	sourceResourceID string,
-	workspaceID string,
-	document node,
-	err error,
-) types.FetchedItem {
-	return types.FetchedItem{
-		ExternalID:       document.ID,
-		Title:            document.title(),
-		SourceResourceID: sourceResourceID,
-		Metadata: map[string]string{
-			"channel":           types.ChannelDingtalk,
-			"workspace_id":      workspaceID,
-			"node_id":           document.ID,
-			"error":             err.Error(),
-			"error_reason_code": "dingtalk_document_failed",
-			"error_reason":      "DingTalk document could not be read; retry on the next sync",
-		},
+func parseWikiResourceID(rid string) (workspaceID, nodeID string) {
+	rid = strings.TrimSpace(rid)
+	if !strings.HasPrefix(rid, prefixWiki) {
+		return "", ""
 	}
+	rest := strings.TrimPrefix(rid, prefixWiki)
+	if idx := strings.Index(rest, prefixNode); idx >= 0 {
+		return rest[:idx], rest[idx+len(prefixNode):]
+	}
+	return rest, ""
 }
 
-func failedResource(resourceID string, err error) types.FetchedItem {
-	return types.FetchedItem{
-		ExternalID:       "dingtalk-resource:" + resourceID,
-		SourceResourceID: resourceID,
-		Metadata: map[string]string{
-			"channel":           types.ChannelDingtalk,
-			"error":             err.Error(),
-			"error_reason_code": "dingtalk_resource_failed",
-			"error_reason":      "DingTalk resource is unavailable; check access and the saved selection, then retry",
-		},
+func isOnlineDocDentry(d dentryItem) bool {
+	if !strings.EqualFold(d.Type, "FILE") {
+		return false
 	}
-}
-
-func decodeCursor(cursor *types.SyncCursor) (*cursorState, error) {
-	empty := &cursorState{
-		Version:   cursorVersion,
-		Resources: make(map[string]map[string]string),
-	}
-	if cursor == nil || cursor.ConnectorCursor == nil {
-		return empty, nil
-	}
-	raw, err := json.Marshal(cursor.ConnectorCursor)
-	if err != nil {
-		return nil, fmt.Errorf("marshal DingTalk cursor: %w", err)
-	}
-	var decoded cursorState
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, fmt.Errorf("decode DingTalk cursor: %w", err)
-	}
-	switch decoded.Version {
-	case 1:
-		decoded.Resources = make(map[string]map[string]string, len(decoded.Workspaces))
-		for workspaceID, revisions := range decoded.Workspaces {
-			decoded.Resources[workspaceID] = cloneRevisions(revisions)
-		}
-		decoded.Workspaces = nil
-		decoded.Version = cursorVersion
-	case cursorVersion:
+	ext := strings.ToLower(strings.TrimPrefix(d.Extension, "."))
+	switch ext {
+	case "", "doc", "docx", "adoc", "markdown", "md":
+		return true
 	default:
-		return nil, fmt.Errorf("unsupported DingTalk cursor version %d", decoded.Version)
+		return false
 	}
-	if decoded.Resources == nil {
-		decoded.Resources = make(map[string]map[string]string)
-	}
-	return &decoded, nil
 }
 
-func encodeCursor(cursor *cursorState) (map[string]interface{}, error) {
-	raw, err := json.Marshal(cursor)
-	if err != nil {
-		return nil, fmt.Errorf("marshal DingTalk cursor: %w", err)
+func isSyncableDriveDentry(d dentryItem) bool {
+	if !strings.EqualFold(d.Type, "FILE") {
+		return false
 	}
-	var encoded map[string]interface{}
-	if err := json.Unmarshal(raw, &encoded); err != nil {
-		return nil, fmt.Errorf("encode DingTalk cursor: %w", err)
-	}
-	return encoded, nil
+	return isOnlineDocDentry(d) || isSupportedUploadedFileExtension(d.Extension)
 }
 
-func uniqueIDs(ids []string) []string {
-	seen := make(map[string]struct{}, len(ids))
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
+func driveDocumentKind(d dentryItem) dingtalkDocumentKind {
+	if isDriveNativeOnlineDocExtension(d.Extension) {
+		return dingtalkDocumentKindNativeDoc
+	}
+	return dingtalkDocumentKindUploadedFile
+}
+
+func isSupportedUploadedFileExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	switch ext {
+	case "pdf", "txt", "md", "markdown", "doc", "docx", "ppt", "pptx", "csv", "xlsx", "xls", "json",
+		"epub", "mhtml", "jpg", "jpeg", "png", "gif", "mp3", "wav", "m4a", "flac", "ogg":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOfficeFileExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	switch ext {
+	case "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "csv":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
 		}
-		if _, exists := seen[id]; exists {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
 	}
-	return out
+	return ""
 }
 
-func parseDingTalkTime(value string) time.Time {
-	value = strings.TrimSpace(value)
-	if value == "" {
+func revisionKey(d dentryItem) string {
+	if d.UpdatedTime != "" {
+		return d.UpdatedTime
+	}
+	return fmt.Sprintf("%s:%d", d.ID, d.Size)
+}
+
+func wikiRevisionKey(n wikiNodeItem) string {
+	if n.UpdatedTime != "" {
+		return n.UpdatedTime
+	}
+	return fmt.Sprintf("%s:%d", n.NodeID, n.Size)
+}
+
+func sheetRevisionUnreliable(ref docRef) bool {
+	return ref.kind == dingtalkDocumentKindNativeSheet && !ref.revisionReliable
+}
+
+func sheetContentFingerprint(content []byte) string {
+	sum := sha256.Sum256(content)
+	return fmt.Sprintf("sha256:%x", sum[:])
+}
+
+func extensionFromWikiNode(n wikiNodeItem) string {
+	if ext := wikiNodeNameExtension(n); ext != "" {
+		return ext
+	}
+	switch strings.ToUpper(n.Category) {
+	case "ALIDOC", "DOC":
+		return "md"
+	case "SPREADSHEET", "SHEET", "ALISHEET", "WORKBOOK":
+		return "xlsx"
+	default:
+		return ""
+	}
+}
+
+func wikiNodeNameExtension(n wikiNodeItem) string {
+	name := strings.ToLower(strings.TrimSpace(n.Name))
+	if idx := strings.LastIndex(name, "."); idx >= 0 && idx < len(name)-1 {
+		return name[idx+1:]
+	}
+	return ""
+}
+
+func parseUpdatedTime(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return time.Time{}
 	}
-	for _, layout := range []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02T15:04:05Z07:00",
-		"2006-01-02T15:04Z07:00",
-		"2006-01-02T15:04:05Z",
-		"2006-01-02T15:04Z",
-	} {
-		if parsed, err := time.Parse(layout, value); err == nil {
-			return parsed
-		}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t
 	}
 	return time.Time{}
 }
 
-func sanitizeFilename(name string) string {
+func pickFileName(name, extension, defaultExt string) string {
 	name = strings.TrimSpace(name)
-	name = strings.Map(func(value rune) rune {
-		if unicode.IsControl(value) {
-			return '_'
-		}
-		return value
-	}, name)
-	name = strings.NewReplacer(
-		"/", "_", "\\", "_", ":", "_", "*", "_", "?", "_",
-		"\"", "_", "<", "_", ">", "_", "|", "_",
-	).Replace(name)
-	name = strings.Trim(name, " ._")
-	if name == "" {
-		return "untitled"
+	ext := strings.TrimPrefix(strings.ToLower(extension), ".")
+	if ext == "" {
+		ext = defaultExt
 	}
-
-	const maxBytes = 200
-	if len(name) > maxBytes {
-		name = name[:maxBytes]
-		for len(name) > 0 {
-			r, size := utf8.DecodeLastRuneInString(name)
-			if r != utf8.RuneError || size != 1 {
-				break
-			}
-			name = name[:len(name)-1]
+	if !strings.HasSuffix(strings.ToLower(name), "."+ext) {
+		if name == "" {
+			name = "document"
 		}
-		name = strings.Trim(name, " ._")
-	}
-	if name == "" {
-		return "untitled"
+		name = name + "." + ext
 	}
 	return name
+}
+
+func markdownFileName(name string) string {
+	return documentFileName(name, "md")
+}
+
+func documentFileName(name, extension string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "document." + extension
+	}
+	if idx := strings.LastIndex(name, "."); idx > 0 {
+		name = name[:idx]
+	}
+	return pickFileName(name, extension, extension)
+}
+
+func isDingTalkNativeOnlineDocExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	switch ext {
+	case "", "adoc":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDriveNativeOnlineDocExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	switch ext {
+	case "", "doc", "docx", "adoc", "markdown", "md":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDingTalkSpreadsheetExtension(extension string) bool {
+	return isDingTalkNativeSpreadsheetExtension(extension) || isOfficeSpreadsheetExtension(extension)
+}
+
+func isDingTalkNativeSpreadsheetExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	return ext == "axls"
+}
+
+func isOfficeSpreadsheetExtension(extension string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(extension), "."))
+	return ext == "xlsx" || ext == "xls"
+}
+
+func isDingTalkNotWorkbookError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not workbook") ||
+		strings.Contains(msg, "不是可读取的表格")
+}
+
+func contentTypeForFileName(fileName string) string {
+	lower := strings.ToLower(fileName)
+	switch {
+	case strings.HasSuffix(lower, ".md"), strings.HasSuffix(lower, ".markdown"):
+		return "text/markdown"
+	case strings.HasSuffix(lower, ".docx"):
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case strings.HasSuffix(lower, ".xlsx"):
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case strings.HasSuffix(lower, ".xls"):
+		return "application/vnd.ms-excel"
+	case strings.HasSuffix(lower, ".pdf"):
+		return "application/pdf"
+	case strings.HasSuffix(lower, ".pptx"):
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	default:
+		return "application/octet-stream"
+	}
 }
