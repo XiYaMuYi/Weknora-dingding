@@ -444,6 +444,13 @@
 
       <!-- 音频处理（ASR）设置 -->
       <div v-if="!isFAQ" v-show="currentSection === 'asr'" class="section">
+      <div v-if="!isFAQ && formData && currentSection === 'imageCompression'" class="section">
+        <KBImageCompressionSettings
+          :kb-id="activeKbId"
+        />
+      </div>
+
+
         <div v-if="formData" class="kb-multimodal-settings">
           <div class="section-header">
             <h2>{{ $t('knowledgeEditor.asr.title') }}</h2>
@@ -610,6 +617,7 @@ import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import KBModelConfig from './settings/KBModelConfig.vue'
 import KBParserSettings from './settings/KBParserSettings.vue'
+import KBImageCompressionSettings from './settings/KBImageCompressionSettings.vue'
 import KBStorageSettings from './settings/KBStorageSettings.vue'
 import KBChunkingSettings from './settings/KBChunkingSettings.vue'
 import KBVectorStoreSettings from './settings/KBVectorStoreSettings.vue'
@@ -783,6 +791,7 @@ const navItems = computed(() => {
     items.push(
       { key: 'parser', icon: 'file-search', label: t('settings.parserEngine') },
       { key: 'multimodal', icon: 'image', label: t('knowledgeEditor.sidebar.multimodal') },
+      { key: 'imageCompression', icon: 'image', label: t('knowledgeEditor.sidebar.imageCompression') },
       { key: 'asr', icon: 'sound', label: t('knowledgeEditor.sidebar.asr') },
       { key: 'storage', icon: 'cloud', label: t('knowledgeEditor.sidebar.storage') },
       { key: 'chunking', icon: 'file-copy', label: t('knowledgeEditor.sidebar.chunking') },
@@ -816,7 +825,7 @@ const navGroups = computed(() => {
     {
       key: 'processing',
       label: t('knowledgeEditor.navGroups.processing'),
-      items: pickItems(['parser', 'chunking', 'multimodal', 'asr', 'graph', 'advanced']),
+      items: pickItems(['parser', 'chunking', 'multimodal', 'imageCompression', 'asr', 'graph', 'advanced']),
     },
     {
       key: 'data',
