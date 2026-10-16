@@ -817,3 +817,32 @@ export const FALLBACK_IMAGE_ATTR_SCHEMA: ImageAttrSchema = {
 // OCR.On wholesale (the "on" list is a unit); a config that only sets
 // on_unobserved keeps the default On. The result is what the form seeds with
 // and what makes an empty custom table safe to open.
+export function mergeImageActions(
+  custom?: ImageActionsConfig | null,
+): ImageActionsConfig {
+  if (custom && custom.ocr && custom.ocr.on && custom.ocr.on.length > 0) {
+    return { ocr: { on: custom.ocr.on, on_unobserved: custom.ocr.on_unobserved } };
+  }
+  return {
+    ocr: {
+      on: DEFAULT_IMAGE_ACTIONS.ocr.on.map((c) => ({ ...c })),
+      on_unobserved: DEFAULT_IMAGE_ACTIONS.ocr.on_unobserved,
+    },
+  };
+}
+
+// Fetch the canonical image-attribute registry + default actions from the
+// backend. The registry drives the attribute panel; the default actions seed
+// the OCR-condition display.
+export async function fetchImageAttrSchema(kbId: string): Promise<ImageAttrSchema> {
+  // The registry is global, not per-KB. The backend exposes it at a top-level
+  // route, the same shape as the other read-only KB-editor helpers
+  // (GET /api/v1/chunker/preview, GET /api/v1/system/parser-engines). kbId is
+  // kept in the signature for callers that pass KB context.
+  void kbId;
+  const res = await get<{ success: boolean; data: ImageAttrSchema }>(
+    `/api/v1/image-attrs/schema`,
+  );
+  return res.data;
+}
+
