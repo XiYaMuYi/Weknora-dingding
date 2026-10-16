@@ -729,3 +729,91 @@ export function batchReparseKnowledge(kbId: string, ids: string[], processConfig
     process_config: processConfig,
   });
 }
+export interface ImageAttrSpec {
+  name: string;
+  type: 'extent' | 'presence';
+  values?: ImageAttrValue[];
+  question: string;
+  label: string;
+  description?: string;
+  consumers?: string[];
+}
+
+// One attribute match: attribute `prop` equals `is`.
+export interface ImageAttrCondition {
+  prop: string;
+  is: string;
+}
+
+// The OCR clause of the attribute -> work policy.
+export interface ImageOCRAction {
+  on: ImageAttrCondition[];
+  on_unobserved: boolean;
+}
+
+// The attribute -> work policy sent back to the API (snake_case JSON).
+export interface ImageActionsConfig {
+  ocr: ImageOCRAction;
+}
+
+// Canonical registry + built-in actions returned by GET /image-attrs/schema.
+export interface ImageAttrSchema {
+  version: string;
+  prompt: string;
+  attributes: ImageAttrSpec[];
+  default_actions: ImageActionsConfig;
+}
+
+// Mirrors backend types.DefaultImageActions. The schema endpoint returns the
+// authoritative copy; this is the fallback used before the schema loads (e.g.
+// in create mode, where no knowledge base id exists yet to query).
+export const DEFAULT_IMAGE_ACTIONS: ImageActionsConfig = {
+  ocr: {
+    on: [
+      { prop: 'contain.text', is: 'block' },
+      { prop: 'contain.data_visual', is: 'true' },
+    ],
+    on_unobserved: true,
+  },
+};
+
+// Display-only fallback used before a KB exists (create mode) so the panel can
+// render without a network call. It mirrors the registry for layout and wording
+// only; the endpoint response is authoritative whenever it loads.
+export const FALLBACK_IMAGE_ATTR_SCHEMA: ImageAttrSchema = {
+  version: 'attrs/2',
+  prompt: 'observe/1',
+  attributes: [
+    {
+      name: 'contain.text',
+      type: 'extent',
+      values: [
+        { value: 'none', label: 'None', description: 'no text at all' },
+        { value: 'sparse', label: 'Sparse', description: 'a few words — a logo, a road sign, a single label' },
+        { value: 'block', label: 'Block', description: 'a block of body text — a screenshot, a table, a document page' },
+      ],
+      question: '',
+      label: 'Text in the image',
+      description: 'How much body text the picture itself carries.',
+      consumers: ['ocr'],
+    },
+    {
+      name: 'contain.data_visual',
+      type: 'presence',
+      values: [
+        { value: 'true', label: 'Yes', description: 'a chart, graph or diagram with plotted values' },
+        { value: 'false', label: 'No', description: 'a photo, drawing, icon or decoration' },
+      ],
+      question: '',
+      label: 'Data visual',
+      description: 'Whether the picture conveys data as a chart, graph, diagram or infographic.',
+      consumers: ['ocr'],
+    },
+  ],
+  default_actions: DEFAULT_IMAGE_ACTIONS,
+};
+
+// Mirrors backend types.MergeImageActions: a custom OCR.On replaces the default
+// OCR.On wholesale (the "on" list is a unit); a config that only sets
+// on_unobserved keeps the default On. The result is what the form seeds with
+// and what makes an empty custom table safe to open.
