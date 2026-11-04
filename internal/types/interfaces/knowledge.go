@@ -243,6 +243,8 @@ type KnowledgeService interface {
 	// StartKnowledgeImageCompression starts the image compression process for a knowledge base.
 	StartKnowledgeImageCompression(ctx context.Context, kbID string) (string, error)
 	// GetKnowledgeImageCompressionProgress returns the progress of image compression for a task.
+	// ProcessKnowledgeImageCompression processes the image compression task.
+	ProcessKnowledgeImageCompression(ctx context.Context, task *asynq.Task) error
 	GetKnowledgeImageCompressionProgress(ctx context.Context, taskID string) (*types.KnowledgeImageCompressionProgress, error)
 }
 
