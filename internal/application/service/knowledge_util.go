@@ -451,6 +451,7 @@ func (s *knowledgeService) resolveFileServiceForPath(ctx context.Context, kb *ty
 }
 
 func IsImageType(fileType string) bool {
+	fileType = strings.ToLower(fileType)
 	switch fileType {
 	case "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tiff":
 		return true
