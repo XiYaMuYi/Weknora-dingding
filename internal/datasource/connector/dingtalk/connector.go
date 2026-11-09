@@ -344,6 +344,13 @@ func (c *Connector) sync(
 				return nil, nil, fmt.Errorf("collect docs for %s: %w", rid, err)
 			}
 			items = appendDingTalkDocListFailureItems(items, partialErr.Failures)
+			// FIX: list_children failed refs must be marked as seen, otherwise
+			// the incremental diff below treats them as "deleted on dingtalk"
+			// when 403/QPS-limit occurs, causing false local deletions and then
+			// full re-ingest (embedding + LLM postprocess) on the next run.
+			for _, f := range partialErr.Failures {
+				seenDocs[f.Ref.externalID] = f.Ref
+			}
 		}
 		for _, ref := range refs {
 			seenDocs[ref.externalID] = ref
